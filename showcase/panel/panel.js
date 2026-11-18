@@ -727,7 +727,7 @@
       ) : null,
     ];
   }
-  const TTS_NAMES = { fish: 'Fish Audio', gemini: 'Gemini', voicestudio: 'VoiceStudio' };
+  const TTS_NAMES = { fish: 'Fish Audio', gemini: 'Gemini', cartesia: 'Cartesia', voicestudio: 'VoiceStudio' };
   function speakingPage() {
     // The service that speaks, each with its own key: Fish Audio's voice is the look's and it has models to pick
     // from; Gemini has a list of voices and two models; VoiceStudio runs on this computer and needs no key.
@@ -744,7 +744,7 @@
         picks('Voice provider', Object.entries(TTS_NAMES), tts, (x) => {
           if (x !== 'voicestudio' && !state[`${x}Key`]) { ui.key = x; note(`Add a ${TTS_NAMES[x]} key to hear me talk.`); } // its key field opens with it
           act(`tts:${x}`);
-        }, 'tts', { fish: 'A voice for each look, acted out with feeling. Billed to your Fish Audio account.', gemini: "Google's voices: pick one of 30. Billed to your Google AI Studio account.", voicestudio: 'The free VoiceStudio app on this computer, in the engine and voices you set up there. Nothing leaves your computer.' }),
+        }, 'tts', { fish: 'A voice for each look, acted out with feeling. Billed to your Fish Audio account.', gemini: "Google's voices: pick one of 30. Billed to your Google AI Studio account.", cartesia: 'Cartesia Sonic voices. If credits run out on a Mac, falls back to the built-in say voice.', voicestudio: 'The free VoiceStudio app on this computer, in the engine and voices you set up there. Nothing leaves your computer.' }),
         local ? el('div', { className: 'reveal', 'data-anim': 'studio' }, studioRows()) : null,
         local ? el('div', { className: 'reveal', 'data-anim': 'studio-speak' },
           el('p', { className: 'sub', textContent: 'How much it speaks' }),
@@ -833,9 +833,10 @@
           el('p', { className: 'sub', textContent: 'Mic waits for you' }),
           picks('Mic waits for you', v.listenChoices.map((s) => [String(s), `${s} s`]), String(v.listenSecs), (x) => act(`listensecs:${x}`), 'listensecs')) : null,
         toggle('Listen after reminders', needs('Mic opens after a reminder, so you can say “snooze 10 minutes”.'), v.snoozeListen, () => act('snoozelisten'), 'snoozelisten'),
-        v.mac ? toggle('Wake word', needs(`Say “Hey ${v.wakeName || 'Roamies'}” to talk. Mic stays on.`), v.wakeWord, () => act('wakeword'), 'wakeword') : null,
-        v.mac ? el('div', { className: 'setting' }, el('span', {}, 'Wake word name', el('small', { textContent: `Hey ${v.wakeName || 'Roamies'}` })),
-          link('Change', () => act('wakename'), { k: 'wakename', aria: 'Change the wake word name' })) : null))];
+        v.mac ? toggle('Wake word', needs(`Say “${v.wakePhrase || `Hey ${v.wakeName || 'Roamie'}`}” to talk. Mic stays on.`), v.wakeWord, () => act('wakeword'), 'wakeword') : null,
+        v.mac ? el('div', { className: 'setting' }, el('span', {}, 'Wake word name', el('small', { textContent: v.wakePhrase || `Hey ${v.wakeName || 'Roamie'}` })),
+          link('Change', () => act('wakename'), { k: 'wakename', aria: 'Change the wake word name' })) : null,
+        v.mac ? toggle('Re-listen after reply', needs('Briefly open the mic again after a spoken reply (with Auto-listen).'), !!v.wakeRelisten, () => act('wakerelisten'), 'wakerelisten') : null))];
   }
   // The keys that work from anywhere. On Wayland no app may hold its own, so it lists the commands to bind instead.
   const SHORTCUT_LABELS = { summon: 'Show or hide me', snap: 'Ask about an area', list: 'Your list' };
@@ -868,6 +869,7 @@
   // Things I do on my own through the day.
   function routinesPage() {
     const f = state.focus;
+    const a = state.addons || {};
     return [
       group('Routines', 'Things I do on my own through the day.', null,
         state.brief ? toggle('Morning briefing', 'The first time you talk to me each day, I start with what’s due.', state.brief.on, () => act('morningbrief'), 'morningbrief') : null,
@@ -875,7 +877,19 @@
         f ? el('div', { className: 'setting' },
           el('span', {}, f.until ? 'Focus block running' : 'Focus distractions',
             el('small', { textContent: f.until ? `Until ${new Date(f.until).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}${f.task ? ` · ${f.task}` : ''}` : `Say “focus for 30 minutes”. I watch for: ${f.list.slice(0, 4).join(', ')}${f.list.length > 4 ? '…' : ''}` })),
-          f.until ? link('Stop', () => act('focusstop'), { k: 'focusstop', aria: 'Stop the focus block' }) : link('Edit', () => act('distractions'), { k: 'distractions', aria: 'Edit the distraction list' })) : null),
+          f.until ? link('Stop', () => act('focusstop'), { k: 'focusstop', aria: 'Stop the focus block' }) : link('Edit', () => act('distracted'), { k: 'distracted', aria: 'Edit the distraction list' })) : null),
+      group('Add-ons', 'Optional extras. Off by default — existing behaviour stays the same.', null,
+        toggle('Pause Roamies', 'Stops wake word, watches and screen memory until you turn this off.', !!a.paused, () => act('paused'), 'paused'),
+        a.mac ? toggle('Low-memory mode', 'Warn when other apps use too much CPU/RAM on 8 GB Macs.', !!a.lowMemoryMode, () => act('lowmemory'), 'lowmemory') : null,
+        a.mac && a.lowMemoryMode ? el('div', { className: 'setting' },
+          el('span', {}, 'Free memory', el('small', { textContent: 'Quit Roamies and get a notification when it is safe to reopen.' })),
+          link('Quit & watch', () => act('quitforram'), { k: 'quitforram', aria: 'Quit Roamies and watch memory' })) : null,
+        toggle('Screen memory', 'Watch the screen quietly (Localbird helper). Uses more RAM.', !!a.screenMemory, () => act('screenmemory'), 'screenmemory'),
+        toggle('OS notifications', 'System notifications for watches and memory warnings.', !!a.osNotify, () => act('osnotify'), 'osnotify'),
+        a.mac ? toggle('Mac Reminders & Calendar', 'Read and edit Reminders.app and Calendar via AppleScript.', !!a.macPim, () => act('macpim'), 'macpim') : null,
+        toggle('Instant shortcuts', 'Exact phrases run an approved open/command without the AI.', !!a.shortcutsOn, () => act('shortcuts'), 'shortcuts'),
+        toggle('Watches', 'Tell me when a file appears — pollers with no AI while waiting.', !!a.watchesOn, () => act('watches'), 'watches'),
+        el('p', { className: 'why', textContent: 'Gmail and WhatsApp: ask me to draft a message — I open the app; Send always asks you first.' })),
     ];
   }
   // What I may do, and when I start.
@@ -1201,7 +1215,7 @@
       fallbacks: { on: true, slots: ['gemini:gemini-3.8-flash', ''], limited: [{ label: 'Claude', until: at + 40 * 60e3 }], using: 'gemini:gemini-3.8-flash' },
       // Effort per slot: '' is automatic (low); computer use is set to High, and backup 1 (Gemini, which only thinks at High) too.
       efforts: { default: '', computer: 'high', code: '', agents: '', draw: '', web: '', backup1: 'high', backup2: '' },
-      voice: { on: true, keys: '⌃⌥', ready: true, mac: true, lang: 'auto', langOnline: null, studioSpeak: 'short', mute: true, autoListen: q.has('listen'), listenEvery: false, listenSecs: 8, listenChoices: [3, 5, 8, 10, 15], mics: [{ id: 'BuiltIn', name: 'MacBook Pro Microphone' }, { id: 'airpods', name: 'AirPods Pro' }], mic: '', micAuto: 'MacBook Pro Microphone', wakeWord: false, wakeName: 'Roamies', download: null }, askKeys: '⌥⌘', brief: { on: true, todoist: false, canTodoist: true }, focus: { until: null, task: '', list: ['YouTube', 'Reddit', 'X', 'Steam', 'Netflix'], custom: false }, sync: { dir: '', at: null, error: null, paused: false }, shortcuts: { talk: { value: 'control+option', pairs: [['control+option', 'Control+Option'], ['option+command', 'Option+Command'], ['control+command', 'Control+Command'], ['control+shift', 'Control+Shift'], ['option+shift', 'Option+Shift']] }, keys: [{ id: 'summon', words: 'Control+Option+S' }, { id: 'snap', words: 'Control+Option+A' }, { id: 'list', words: 'Control+Option+L' }] }, writeKeys: { value: 'option+command', pairs: [['option+command', 'Option+Command'], ['control+command', 'Control+Command'], ['control+shift', 'Control+Shift'], ['option+shift', 'Option+Shift']] },
+      voice: { on: true, keys: '⌃⌥', ready: true, mac: true, lang: 'auto', langOnline: null, studioSpeak: 'short', mute: true, autoListen: q.has('listen'), listenEvery: false, listenSecs: 8, listenChoices: [3, 5, 8, 10, 15], mics: [{ id: 'BuiltIn', name: 'MacBook Pro Microphone' }, { id: 'airpods', name: 'AirPods Pro' }], mic: '', micAuto: 'MacBook Pro Microphone', wakeWord: false, wakeName: 'Roamie', wakePhrase: 'Hey Roamie', wakeRelisten: false, download: null }, askKeys: '⌥⌘', brief: { on: true, todoist: false, canTodoist: true }, focus: { until: null, task: '', list: ['YouTube', 'Reddit', 'X', 'Steam', 'Netflix'], custom: false }, sync: { dir: '', at: null, error: null, paused: false }, addons: { lowMemoryMode: false, screenMemory: false, osNotify: false, macPim: false, shortcutsOn: false, watchesOn: false, paused: false, mac: true }, shortcuts: { talk: { value: 'control+option', pairs: [['control+option', 'Control+Option'], ['option+command', 'Option+Command'], ['control+command', 'Control+Command'], ['control+shift', 'Control+Shift'], ['option+shift', 'Option+Shift']] }, keys: [{ id: 'summon', words: 'Control+Option+S' }, { id: 'snap', words: 'Control+Option+A' }, { id: 'list', words: 'Control+Option+L' }] }, writeKeys: { value: 'option+command', pairs: [['option+command', 'Option+Command'], ['control+command', 'Control+Command'], ['control+shift', 'Control+Shift'], ['option+shift', 'Option+Shift']] },
       sound: true, notch: q.has('notch') ? 'drop' : null, actions: false, skipAllow: false, login: { on: true },
       update: { available: new URLSearchParams(location.search).has('update') && new URLSearchParams(location.search).get('update') !== 'failed' ? '0.9.1' : null, installing: false, checking: false, result: null },
       intro: false,

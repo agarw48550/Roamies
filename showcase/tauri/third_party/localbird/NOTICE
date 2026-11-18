@@ -1,0 +1,3 @@
+Vendored from https://github.com/littlebirdai/localbird for personal/non-commercial use in this Roamies fork.
+Upstream currently publishes no SPDX license file; retained for private adaptation of screen-capture + memory patterns.
+Roamies does not ship Localbird's Electron UI — only capture/memory helper pieces, driven by Roamies' sidecar.

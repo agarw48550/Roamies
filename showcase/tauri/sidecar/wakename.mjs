@@ -1,15 +1,17 @@
 // The wake word's name, chosen by the user ("Hey Jarvis"). The voice helper (voice/main.swift, WakeWord.setName) applies
 // the same rule; this one turns a typed name into one to save, or says why not, before it gets that far.
-export const DEFAULT_WAKE_NAME = 'Roamies';
+export const DEFAULT_WAKE_NAME = 'Roamie';
+// Default spoken forms the Mac wake matcher accepts for "Hey Roamie" / "Hey Roamies" (Swift WakeWord.defaultNames).
+export const DEFAULT_WAKE_ALIASES = ['roamie', 'roamies', 'roamy', 'romie'];
 // Words people say all the time: as a wake name, "Hey there"-style chatter would wake Roamies.
 const COMMON = new Set(['hello', 'there', 'okay', 'yeah', 'thanks', 'sorry', 'right', 'what', 'this', 'that', 'with', 'have',
   'just', 'like', 'about', 'would', 'could', 'really', 'maybe', 'guys', 'everyone', 'everybody', 'buddy', 'listen', 'look',
   'siri', 'alexa', 'google']);
 
-/** Typed text → { ok: true, name } (name '' means back to Roamies) or { ok: false, why }. */
+/** Typed text → { ok: true, name } (name '' means back to Roamie) or { ok: false, why }. */
 export function cleanWakeName(raw) {
   const t = String(raw ?? '').trim().replace(/^(hey|hi)[\s,]+/i, '');
-  if (!t || /^roamies?$/i.test(t)) return { ok: true, name: '' };
+  if (!t || /^roamies?$/i.test(t) || /^roamy$/i.test(t) || /^romie$/i.test(t)) return { ok: true, name: '' };
   if (/\s/.test(t)) return { ok: false, why: 'Just one word, please, like Jarvis.' };
   const w = t.replace(/[^\p{L}]/gu, '');
   if (w.length !== t.length) return { ok: false, why: 'Letters only, please.' };
@@ -20,3 +22,6 @@ export function cleanWakeName(raw) {
 }
 
 export const wakeName = (config) => config?.wakeName || DEFAULT_WAKE_NAME;
+
+/** Phrase shown in the panel / onboarding for the current wake name. */
+export const wakePhrase = (config) => `Hey ${wakeName(config)}`;

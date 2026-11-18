@@ -466,14 +466,15 @@ final class AutoGain {
 // The name can be the user's own ("Hey Jarvis"); the greeting stays, so the name alone in a sentence never wakes it.
 enum WakeWord {
     static let greetings: Set<String> = ["hey", "hi", "hay", "heya", "hiya"]
-    static let defaultNames = ["roamies", "roamie"]
+    // Includes common mishears of "Roamie" / "Roamies" so "Hey Roamie" wakes reliably.
+    static let defaultNames = ["roamies", "roamie", "roamy", "romie"]
     // Set and read on the main thread.
     private(set) static var names = defaultNames
-    /// The chosen name as a word for the recogniser's hints ("Jarvis"); nil for Roamies.
+    /// The chosen name as a word for the recogniser's hints ("Jarvis"); nil for Roamie.
     private(set) static var custom: String?
-    static var hints: [String] { ["Roamies", "Roamie", "JARVIS"] + (custom.map { [$0] } ?? []) }
+    static var hints: [String] { ["Roamie", "Roamies", "Roamy", "Romie", "JARVIS"] + (custom.map { [$0] } ?? []) }
 
-    /// Sets the name after the greeting; nil, "" or Roamies goes back to Roamies. Letters only, 4 to 20 of them;
+    /// Sets the name after the greeting; nil, "" or Roamie/Roamies goes back to defaults. Letters only, 4 to 20 of them;
     /// anything else is refused (returns false) and the name stays as it was.
     @discardableResult static func setName(_ raw: String?) -> Bool {
         let w = (raw ?? "").lowercased().filter { $0.isLetter }
@@ -484,9 +485,9 @@ enum WakeWord {
         return true
     }
 
-    /// Whether a heard word (within the allowed edits) is shaped like the name. Roamies keeps its own tuned rule.
+    /// Whether a heard word (within the allowed edits) is shaped like the name. Roamie keeps its own tuned rule.
     static func plausible(_ heard: String) -> Bool {
-        guard custom != nil, let n = names.first else { return heard.hasPrefix("r") && heard.contains("m") && heard.count >= 5 }
+        guard custom != nil, let n = names.first else { return heard.hasPrefix("r") && heard.contains("m") && heard.count >= 4 }
         return heard.first == n.first && heard.count >= n.count - 1
     }
 

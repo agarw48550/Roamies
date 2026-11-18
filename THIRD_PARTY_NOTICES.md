@@ -14,6 +14,8 @@ Roamies is licensed under [AGPL-3.0](LICENSE). It builds on the components below
 | [Natural Earth](https://www.naturalearthdata.com) 1:110m countries | country outlines for map cards (`showcase/roamies/world.js`) and their names (`showcase/tauri/sidecar/countries.mjs`) | Public domain |
 | [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [ONNX export by istupakov](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx) | Windows speech model, downloaded at setup, not bundled | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
 | [parakeet-rs](https://github.com/altunenes/parakeet-rs) 0.4.3 | runs the speech model in the Windows voice helper | MIT OR Apache-2.0 |
+| [Localbird](https://github.com/littlebirdai/localbird) (selected capture/memory sources) | optional screen-memory helper under `showcase/tauri/third_party/localbird/` (personal/non-commercial fork use; no Electron UI) | Upstream publishes no SPDX license; see that folder's `NOTICE` |
+| [Atticus](https://github.com/SaarthurR/atticus-mac) (ideas only) | behaviours inspiring shortcuts, watches, pause — not vendored | MIT |
 
 ## Full dependency list
 

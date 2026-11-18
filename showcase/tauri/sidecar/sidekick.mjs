@@ -6,7 +6,7 @@
 // out: {type:'menu', items} {type:'ui', msg} {type:'overlays', ids}
 import { Agent } from '@kenkaiiii/gg-agent';
 import { ClaudeCodeAgent, claudeCodeInstaller, closeSpare } from './claudecode.mjs';
-import { SAFE, checkDrawAction, checkLink, checkOpen, checkRead, checkWrite, redactArgs } from './safety.mjs';
+import { SAFE, ASK as ASK_LEVEL, BLOCK, checkDrawAction, checkLink, checkOpen, checkRead, checkWrite, classifyCommand, redactArgs } from './safety.mjs';
 import { agentsRoot, createAgents, holdAfterLaunch, newsDesk, wantsAgent } from './agents.mjs';
 import { agentEvents, stallWatch } from './agentstream.mjs';
 import { CATALOG_PROVIDERS, createCatalogs } from './catalogs.mjs';
@@ -31,7 +31,7 @@ import { foldInput, foldPrompt, memoryInput, memoryPrompt, oneShot, parseBrain, 
 import { briefNote } from './brief.mjs';
 import { CHECK_MS, DEFAULT_DISTRACTIONS, check as focusCheck, parseDistractions, startBlock } from './focus.mjs';
 import { saveCardImage } from './cardimage.mjs';
-import { cleanWakeName, wakeName } from './wakename.mjs';
+import { cleanWakeName, wakeName, wakePhrase } from './wakename.mjs';
 import { KEY_NAME as SYNC_KEY, MIN_PASSPHRASE, checkFolder, folderReady, merge as syncMerge, newDevice, prepareFolder, readRemotes, suggestFolders, tooMuchGone, writeOwn } from './sync.mjs';
 import { EMOTES, EchoFilter, ReplyStream } from './reply.mjs';
 import { downloadModel, isReady, modelDir, sizeLabel, totalBytes } from './voicemodel.mjs';
@@ -50,6 +50,7 @@ import { SLOTS, isSetting, resolveEffort } from './effort.mjs';
 import { pickNotch } from './notch.mjs';
 import { DEFAULT_VOICE, FISH_CHOICES } from './fish.mjs';
 import { GEMINI_CHOICES, GEMINI_DEFAULT_VOICE, GEMINI_LOOK_VOICES, GEMINI_MODEL, GEMINI_VOICES } from './gemini.mjs';
+import { CARTESIA_CHOICES, DEFAULT_VOICE as CARTESIA_DEFAULT_VOICE } from './cartesia.mjs';
 import { createSecrets, retryLoad, runInput } from './secrets.mjs';
 import { showTrayIcon } from './wintray.mjs';
 import { createActivity } from './activity.mjs';
@@ -60,6 +61,11 @@ import { activityLogs, buildReport, redact, reportDir, reportName, reveal, run, 
 import { detailsText, explain } from './errors.mjs';
 import { aboutRoamies } from './about.mjs';
 import { whatsNewOnStart } from './whatsnew.mjs';
+import { createResourceGuard, installRelaunchWatcher, uninstallRelaunchWatcher, DEFAULT_THRESHOLDS } from './resource-guard.mjs';
+import { notify } from './notify.mjs';
+import { createAddonTools } from './addons.mjs';
+import { createWatchRunner } from './watch.mjs';
+import { spawnScreenmemHelper } from './screenmem.mjs';
 import { z } from 'zod';
 
 console.log = console.info = (...a) => console.error(...a);
@@ -122,12 +128,23 @@ const DEFAULTS = {
   onboarded: false, onboardStep: 0, filesAsked: false, keys: DEFAULT_KEYS, muteWhileTalking: true, autoListen: false, listenEvery: false, listenSecs: 8, lite: false, wakeWord: false, setupVersion: 0, size: 'default', look: 'classic', introDone: false,
   replies: 'text', // 'voice': spoken (with Fish Audio or Gemini) as well as shown
   speechLang: 'auto', // the language talking is recognised in (macOS): 'auto' follows the Mac's language list, or a locale like 'ar-SA'
-  tts: 'fish', // which one speaks: 'fish' (Fish Audio), 'gemini' or 'voicestudio' (the VoiceStudio app on this computer)
+  tts: 'fish', // which one speaks: 'fish' (Fish Audio), 'gemini', 'cartesia' or 'voicestudio' (the VoiceStudio app on this computer)
   studioSpeak: 'short', // how much VoiceStudio says out loud: 'short', 'medium' or 'full' (it renders slower than real time)
   studioVoices: {}, // look → its VoiceStudio voice (a saved profile id; none: the selected engine's default voice)
   fishModel: FISH_CHOICES[0].id, // Drama 3 (most expressive) or S2.1 Pro (natural pace, cheaper)
   geminiVoices: {}, // look → the Gemini voice it speaks in, where picked in the setup guide or the panel (else GEMINI_LOOK_VOICES)
   geminiModel: GEMINI_MODEL, // Flash Lite (quick, cheaper) or Flash (studio quality)
+  // --- opt-in addons (all default off; existing installs unchanged) ---
+  cartesiaVoice: CARTESIA_DEFAULT_VOICE,
+  cartesiaModel: CARTESIA_CHOICES[0].id,
+  lowMemoryMode: false, // M2 8GB resource guard
+  wakeRelisten: false, // brief mic reopen after a spoken reply (with autoListen patterns)
+  screenMemory: false, // Localbird-style continuous screen memory
+  osNotify: false, // system notifications for watches / resource warnings
+  macPim: false, // Reminders.app + Calendar.app bridges
+  shortcutsOn: false, // instant phrase shortcuts
+  watchesOn: false, // file/until watchers
+  paused: false, // global pause: stops wake/routines/screenmem/watches
 };
 const LINUX = process.platform === 'linux';
 // Linux: "x11" or "wayland" (the app says which). Wayland keeps apps from seeing the pointer over other apps and
@@ -207,13 +224,14 @@ const saveConfig = () => writeJson(CONFIG_PATH, routed && defaultPick ? { ...con
 const TTS = {
   fish: { id: 'fish', name: 'Fish Audio', secret: 'fish-audio', site: 'fish.audio' },
   gemini: { id: 'gemini', name: 'Gemini', secret: 'gemini-tts', site: 'aistudio.google.com' },
+  cartesia: { id: 'cartesia', name: 'Cartesia', secret: 'cartesia', site: 'cartesia.ai' },
   // On this computer: no key, never falls back to a paid service when it isn't running.
   voicestudio: { id: 'voicestudio', name: 'VoiceStudio', local: true },
 };
 const tts = () => TTS[config.tts] ?? TTS.fish;
 // Which have a key to speak with: 'own' (saved for the voice), 'shared' (Gemini only: the AI's Gemini key, from the
 // Model page, when no key was saved just for the voice) or false. For the one in use, speech.on says.
-const ttsKeys = { fish: false, gemini: false };
+const ttsKeys = { fish: false, gemini: false, cartesia: false };
 const hasVoiceKey = (id) => (id === tts().id ? speech.on : !!ttsKeys[id]);
 // The key the AI uses for Gemini, if it's an API key (the same Google AI Studio key speaks too).
 const brainGeminiKey = () => auth.resolveApiKey('gemini').then((c) => c?.accessToken || null).catch(() => null);
@@ -262,6 +280,7 @@ function aimSpeaker(id) {
   speech.setStudioSpeak?.(config.studioSpeak); // how much VoiceStudio says out loud
   if (TTS[id]?.local) speech.setLocalVoice(studioVoice());
   else if (id === 'gemini') { speech.setVoice(geminiVoice()); speech.setModel(config.geminiModel); }
+  else if (id === 'cartesia') { speech.setVoice(config.cartesiaVoice || CARTESIA_DEFAULT_VOICE); speech.setModel(config.cartesiaModel); }
   else { speech.setVoice(lookVoice()); speech.setModel(config.fishModel); }
 }
 // The same, with its key: the one given, else the saved one.
@@ -650,6 +669,57 @@ tools.push({
   parameters: z.object({}),
   execute: async () => aboutRoamies({ name: lookName(), looks: LOOKS.map(([, label]) => label), mac: MAC, linux: LINUX, snap: SNAP_OK, pointer: POINTER_OK, voice: VOICE_OK, hotkeys: HOTKEYS_OK }),
 });
+// Opt-in addons (PIM, WhatsApp/Gmail drafts, screen memory, shortcuts, watches). Flags default off.
+const DATA_DIR = path.join(path.dirname(CONFIG_PATH), 'sidekick');
+let screenMemThrottle = false;
+const watchRunner = createWatchRunner({
+  dataDir: DATA_DIR,
+  enabled: () => !!config.watchesOn && !config.paused,
+  onFire: async (w, detail) => {
+    const body = w.message || detail || 'Watch finished.';
+    if (config.osNotify) await notify({ title: lookName(), body }).catch(() => {});
+    say(body, 'happy');
+  },
+});
+const addonTools = createAddonTools({
+  allowActions: () => !!config.allowActions,
+  ask,
+  userName,
+  dataDir: DATA_DIR,
+  openTarget: async (target) => { openUrl(target); return `Opened ${target}`; },
+  gates: {
+    get macPim() { return !!config.macPim && MAC; },
+    get screenMemory() { return !!config.screenMemory; },
+    get shortcuts() { return !!config.shortcutsOn; },
+    get watches() { return !!config.watchesOn; },
+    get osNotify() { return !!config.osNotify; },
+  },
+  watches: watchRunner,
+  screenMemPaused: () => screenMemThrottle || !!config.paused,
+});
+tools.push(...addonTools.filter((t) => typeof t === 'object' && t.name));
+if (config.watchesOn) watchRunner.start();
+uninstallRelaunchWatcher(DATA_DIR); // clear any leftover safe-to-relaunch agent from a prior quit
+const resourceGuard = createResourceGuard({
+  enabled: !!config.lowMemoryMode && MAC,
+  onWarn: async (a) => {
+    if (config.osNotify) await notify({ title: lookName(), body: a.message }).catch(() => {});
+    say(a.message, 'concerned');
+  },
+  onThrottle: (a) => {
+    screenMemThrottle = !!a.throttleScreenMem;
+    if (config.screenMemory && addonTools._screenmemControl) {
+      addonTools._screenmemControl.configure({ paused: screenMemThrottle || !!config.paused }).catch(() => {});
+    }
+  },
+});
+if (config.lowMemoryMode && MAC) resourceGuard.start();
+if (config.screenMemory && !config.paused) {
+  const helper = process.env.ROAMIES_SCREENMEM
+    || path.join(path.dirname(fileURLToPath(import.meta.url)), 'screenmem-helper.mjs');
+  spawnScreenmemHelper(helper, { dataDir: path.join(DATA_DIR, 'screenmem') });
+  addonTools._screenmemControl?.start?.().catch(() => {});
+}
 // Background agents (agents.mjs): each runs in its own process on the model picked when it starts.
 let turnImage = null; // the picture sent with the request being answered, for send_agent's "snap"
 const agents = createAgents({
@@ -976,9 +1046,47 @@ let credsBaseUrl;
 
 // One run at a time: a new request waits for (or interrupts) the current one. Folding waits until none is left.
 let queued = 0;
+async function runShortcut(sc) {
+  if (sc.kind === 'open') {
+    const v = checkOpen(sc.target, HOME, {});
+    if (v.level === BLOCK) throw new Error(v.reason || 'Blocked.');
+    openUrl(sc.target);
+    say(`Opened ${sc.target}.`, 'happy');
+    return;
+  }
+  if (sc.kind === 'command') {
+    if (!config.allowActions) { say('Actions are off, so that shortcut can’t run a command.', 'concerned'); return; }
+    const v = classifyCommand(sc.target, HOME, { exists: existsSync, cwd: HOME });
+    if (v.level === BLOCK) { say(v.reason || 'That command is blocked.', 'concerned'); return; }
+    if (v.level === ASK_LEVEL || sc.ask) {
+      const ok = await ask({ prompt: `Run shortcut command \`${sc.target.slice(0, 70)}\`?`, yesNo: true });
+      if (!ok || !/^(y|yes|ok|sure|yeah|yep)\b/i.test(String(ok))) { say('Okay, skipped.', 'happy'); return; }
+    }
+    const { execFile: execFileP } = await import('node:child_process');
+    await new Promise((resolve, reject) => {
+      execFileP(process.env.SHELL || (process.platform === 'linux' ? '/bin/bash' : '/bin/zsh'), ['-lc', sc.target], { cwd: HOME, timeout: 60_000 }, (err) => (err ? reject(err) : resolve()));
+    });
+    say('Done.', 'happy');
+  }
+}
+
 function enqueue(text, { interrupt = false, image = null, note = '', byVoice = false, listenAfter = false, news = null } = {}) {
+  if (config.paused && !String(text || '').startsWith('(System')) {
+    say("I'm paused. Turn off Pause in the panel to talk again.", 'concerned');
+    return Promise.resolve();
+  }
+  // Instant shortcuts: exact phrase match skips the LLM (Atticus-inspired).
+  if (config.shortcutsOn && !image && !news) {
+    const sc = addonTools._findShortcut?.(text);
+    if (sc) {
+      if (interrupt && busy) interruptQuietly('new request');
+      return runShortcut(sc).catch((e) => { console.error('shortcut', e); say(e.message || 'Shortcut failed.', 'concerned'); });
+    }
+  }
   if (interrupt && busy) interruptQuietly('new request');
   queued++;
+  // Optional wake re-listen: after a spoken reply, briefly reopen the mic (gated; defaults off).
+  listenAfter = !!(listenAfter || (byVoice && config.wakeRelisten && config.autoListen));
   running = running.then(() => prompt(text, image, note, byVoice, news, listenAfter)).catch((e) => console.error('prompt', e))
     .finally(() => { if (--queued === 0) maybeCompact(); });
   return running;
@@ -2110,17 +2218,22 @@ function panelState() {
     commitments: openCommitments().map((c) => ({ id: c.id, text: c.text, due: c.due ?? null, when: c.due ? `${fmtWhen(c.due)}${c.repeat ? ` · repeats ${repeatLabel(c.repeat)}` : ''}` : '', overdue: !!(c.due && c.due < Date.now()), repeat: c.repeat ?? null })),
     look: config.look ?? 'classic', looks: LOOKS.map(([id, label]) => [id, label]), name: lookName(),
     size: sizeNow(), sizes: SIZES,
-    replies: VOICE_ON() ? 'voice' : 'text', tts: tts().id, fishKey: hasVoiceKey('fish'), geminiKey: hasVoiceKey('gemini'),
+    replies: VOICE_ON() ? 'voice' : 'text', tts: tts().id, fishKey: hasVoiceKey('fish'), geminiKey: hasVoiceKey('gemini'), cartesiaKey: hasVoiceKey('cartesia'),
     fishModel: config.fishModel, fishModels: FISH_CHOICES, fishFree: tts().id === 'fish' && speech.on && speech.model.endsWith('-free'),
     geminiVoice: geminiVoice(), geminiVoices: GEMINI_VOICES, geminiShared: ttsKeys.gemini === 'shared',
     geminiModel: config.geminiModel, geminiModels: GEMINI_CHOICES,
+    cartesiaModel: config.cartesiaModel, cartesiaModels: CARTESIA_CHOICES, cartesiaVoice: config.cartesiaVoice,
     studio: tts().local ? studioState() : null,
     voice: VOICE_OK ? {
-      on: !!config.voice, lang: speechLangId(), langOnline: langInfo && langInfo.id === speechLangId() ? langInfo.online : null, studioSpeak: config.studioSpeak === 'full' || config.studioSpeak === 'medium' ? config.studioSpeak : 'short', keys: HOTKEYS_OK ? talkSymbols() : null, ready: voiceReady(), mac: MAC, mute: config.muteWhileTalking !== false, autoListen: !!config.autoListen, listenEvery: !!config.listenEvery, listenSecs: listenSecs(), listenChoices: LISTEN_SECS, snoozeListen: !!config.snoozeListen, wakeWord: !!config.wakeWord, wakeName: wakeName(config),
+      on: !!config.voice, lang: speechLangId(), langOnline: langInfo && langInfo.id === speechLangId() ? langInfo.online : null, studioSpeak: config.studioSpeak === 'full' || config.studioSpeak === 'medium' ? config.studioSpeak : 'short', keys: HOTKEYS_OK ? talkSymbols() : null, ready: voiceReady(), mac: MAC, mute: config.muteWhileTalking !== false, autoListen: !!config.autoListen, listenEvery: !!config.listenEvery, listenSecs: listenSecs(), listenChoices: LISTEN_SECS, snoozeListen: !!config.snoozeListen, wakeWord: !!config.wakeWord, wakeName: wakeName(config), wakePhrase: wakePhrase(config), wakeRelisten: !!config.wakeRelisten,
       // The mic picker: what the voice helper lists, the pick ('' is automatic) and the mic automatic uses now.
       mics: mics.list, mic: config.mic ?? '', micAuto: mics.list.find((x) => x.id === mics.auto)?.name ?? '',
       download: NEEDS_MODEL && config.voice && !voiceReady() ? { status: voiceModel.status, pct: voiceModel.total ? Math.floor((voiceModel.done / voiceModel.total) * 100) : 0, size: sizeLabel() } : null,
     } : null,
+    addons: {
+      lowMemoryMode: !!config.lowMemoryMode, screenMemory: !!config.screenMemory, osNotify: !!config.osNotify,
+      macPim: !!config.macPim, shortcutsOn: !!config.shortcutsOn, watchesOn: !!config.watchesOn, paused: !!config.paused, mac: MAC,
+    },
     sound: !!config.sound, actions: !!config.allowActions, skipAllow: !!config.skipAllow, lite: !!config.lite, hybrid: { on: !!config.hybrid, jobs: JOB_KINDS.map((j) => ({ ...j, value: parseSpec(config.heavy?.[j.kind])?.spec ?? '' })), active: routed?.spec ?? '' }, subagents: { on: !!config.subagents, delegate: DELEGATE_MODES.includes(config.delegate) ? config.delegate : 'ask', crew: SUBAGENTS.map((s) => { const c = activeCrew(config.crew, runnableSpec, hybridActive() ? config.heavy : null).find((x) => x.id === s.id); return { id: s.id, label: s.label, hint: s.hint, value: parseSpec(config.crew?.[s.id])?.spec ?? '', via: c?.via ?? '', uses: c?.spec.spec ?? '' }; }) }, efforts: Object.fromEntries(SLOTS.map((k) => [k, config.efforts?.[k] ?? ''])), fallbacks: { on: !!config.backups, slots: [0, 1].map((i) => parseSpec(config.fallbacks?.[i])?.spec ?? ''), limited: limits.list().filter((l) => !l.key.includes(':') && (isQuota(l.kind) || l.kind === 'busy')).map((l) => ({ label: PROVIDER_LABELS[l.key] ?? l.key, until: l.until })), unavailable: limits.list().filter((l) => !(isQuota(l.kind) || l.kind === 'busy')).map((l) => ({ label: PROVIDER_LABELS[l.key] ?? modelName(l.key.split(':').slice(1).join(':')) ?? l.key, why: becauseOf(l.kind), until: l.until })), using: routed && /^backup/.test(routed.slot ?? '') ? routed.spec : '' }, notch: MAC && notchScreen ? notchMode() : null, brief: { on: !!config.morningBrief, todoist: !!config.briefTodoist, canTodoist: HANDS_OK }, focus: HANDS_OK ? { until: focusBlock?.until ?? null, task: focusBlock?.task ?? '', list: distractionList(), custom: !!config.distractions } : null, sync: { dir: config.syncDir || '', at: syncInfo.at, error: syncInfo.error, paused: !!syncInfo.paused }, gameMode: HANDS_OK ? config.gameSidebar !== false : null,
     login: login.supported ? { on: login.on } : null,
     update: { available: update.available, installing: update.installing, checking: update.checking, result: update.result, page: update.page, done: update.done },
@@ -2136,7 +2249,7 @@ const SPEECH_LANGS = ['auto', 'en-US', 'ar-SA', 'he-IL', 'es-ES', 'fr-FR', 'de-D
 const speechLangId = () => (SPEECH_LANGS.includes(config.speechLang) ? config.speechLang : 'auto');
 let langInfo = null; // what the voice helper settled on for it: { id, engine, online }
 const voiceConfig = () => {
-  send({ type: 'voice_config', enabled: VOICE_OK && config.voice && voiceReady(), mute: config.muteWhileTalking !== false, sound: !!config.sound, wake: MAC && !!config.wakeWord, wakeName: config.wakeName || '', lang: MAC ? speechLangId() : 'auto', ...(NEEDS_MODEL ? { model: MODEL_DIR } : {}) });
+  send({ type: 'voice_config', enabled: VOICE_OK && config.voice && voiceReady() && !config.paused, mute: config.muteWhileTalking !== false, sound: !!config.sound, wake: MAC && !!config.wakeWord && !config.paused, wakeName: config.wakeName || '', lang: MAC ? speechLangId() : 'auto', ...(NEEDS_MODEL ? { model: MODEL_DIR } : {}) });
   // The native listening pill beside the cursor stays hidden while the notch capsule is where I appear.
   send({ type: 'pill', on: notchMode() === 'off' });
 };
@@ -2432,12 +2545,54 @@ async function onMenu(id, via) {
   else if (id === 'snoozelisten') { config.snoozeListen = !config.snoozeListen; saveConfig(); menu(); }
   else if (id === 'wakeword' && MAC) { config.wakeWord = !config.wakeWord; saveConfig(); agentStale = true; voiceConfig(); menu(); }
   else if (id === 'wakename' && MAC) {
-    const typed = await ask({ prompt: `Wake word: what should come after "Hey"? (now ${wakeName(config)}; leave empty for Roamies)`, placeholder: 'Jarvis' });
+    const typed = await ask({ prompt: `Wake word: what should come after "Hey"? (now ${wakeName(config)}; leave empty for Roamie)`, placeholder: 'Jarvis' });
     if (typed == null) return;
     const r = cleanWakeName(typed);
     if (!r.ok) { say(r.why, 'concerned'); return; }
     config.wakeName = r.name; saveConfig(); agentStale = true; voiceConfig(); menu();
-    say(config.wakeWord ? `Got it. Say "Hey ${wakeName(config)}" and I'm listening.` : `Saved. Turn on the wake word, then say "Hey ${wakeName(config)}".`, 'happy');
+    say(config.wakeWord ? `Got it. Say "${wakePhrase(config)}" and I'm listening.` : `Saved. Turn on the wake word, then say "${wakePhrase(config)}".`, 'happy');
+  }
+  else if (id === 'wakerelisten' && MAC) { config.wakeRelisten = !config.wakeRelisten; saveConfig(); menu(); }
+  else if (id === 'lowmemory' && MAC) {
+    config.lowMemoryMode = !config.lowMemoryMode; saveConfig();
+    resourceGuard.setEnabled(!!config.lowMemoryMode);
+    if (!config.lowMemoryMode) screenMemThrottle = false;
+    menu();
+  }
+  else if (id === 'screenmemory') {
+    config.screenMemory = !config.screenMemory; saveConfig();
+    if (config.screenMemory && !config.paused) {
+      const helper = process.env.ROAMIES_SCREENMEM || path.join(path.dirname(fileURLToPath(import.meta.url)), 'screenmem-helper.mjs');
+      spawnScreenmemHelper(helper, { dataDir: path.join(DATA_DIR, 'screenmem') });
+      addonTools._screenmemControl?.start?.().catch(() => {});
+    } else addonTools._screenmemControl?.stop?.().catch(() => {});
+    menu();
+  }
+  else if (id === 'osnotify') { config.osNotify = !config.osNotify; saveConfig(); menu(); }
+  else if (id === 'macpim' && MAC) { config.macPim = !config.macPim; saveConfig(); agentStale = true; menu(); }
+  else if (id === 'shortcuts') { config.shortcutsOn = !config.shortcutsOn; saveConfig(); menu(); }
+  else if (id === 'watches') {
+    config.watchesOn = !config.watchesOn; saveConfig();
+    if (config.watchesOn) watchRunner.start(); else watchRunner.stop();
+    menu();
+  }
+  else if (id === 'paused') {
+    config.paused = !config.paused; saveConfig();
+    if (config.paused) {
+      if (MAC) voiceConfig(); // wake off while paused via voice_config below
+      addonTools._screenmemControl?.configure?.({ paused: true }).catch(() => {});
+    } else if (config.screenMemory) addonTools._screenmemControl?.configure?.({ paused: !!screenMemThrottle }).catch(() => {});
+    menu();
+  }
+  else if (id === 'quitforram' && MAC) {
+    installRelaunchWatcher(DATA_DIR, { freeRatio: DEFAULT_THRESHOLDS.freeRatio });
+    say('Okay — I\'ll notify you when memory looks fine again. Quitting now.', 'happy');
+    setTimeout(() => send({ type: 'quit' }), 800);
+  }
+  else if (id.startsWith('cartesiamodel:') && CARTESIA_CHOICES.some((c) => c.id === id.slice(14))) {
+    config.cartesiaModel = id.slice(14); saveConfig();
+    if (tts().id === 'cartesia') speech.setModel(config.cartesiaModel);
+    menu();
   }
   else if (id === 'voicedl') startVoiceDownload();
   else if (id === 'voice') {

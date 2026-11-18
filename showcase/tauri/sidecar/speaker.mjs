@@ -19,14 +19,18 @@ import { DEFAULT_VOICE, FISH_MODELS, FREE_MODEL, FishVoice, RATE, fishAccount } 
 import { StudioVoice, studioStatus } from './voicestudio.mjs';
 import { cueFeel } from './speech.mjs';
 import { GEMINI_DEFAULT_VOICE, GEMINI_MODEL, GEMINI_MODELS, GEMINI_PITCH, GEMINI_RATE, GeminiVoice, geminiAccount } from './gemini.mjs';
+import { CARTESIA_MODEL, CARTESIA_MODELS, CARTESIA_RATE, CartesiaVoice, DEFAULT_VOICE as CARTESIA_DEFAULT_VOICE, cartesiaAccount } from './cartesia.mjs';
+import { SAY_RATE, SayVoice } from './macos-say.mjs';
 
 // The services that can speak. models: priciest first, the pick and the ones after it are tried in turn; pick:
 // the one used until the user picks (else the first); freeModel: the one for an account with no credit; rate:
 // the PCM's sample rate; warmDelay: how long a key, voice or model must stay put before its beats are made
 // (Gemini has 30 voices to try out, and making 34 beats for each one passed over would waste the allowance).
+// sayFallback: Cartesia only — on quota/key/network failure before audio, retry this reply via macOS say (never Fish/Gemini).
 export const PROVIDERS = {
   fish: { id: 'fish', name: 'Fish Audio', Voice: FishVoice, account: fishAccount, models: FISH_MODELS, freeModel: FREE_MODEL, rate: RATE, defaultVoice: DEFAULT_VOICE },
   gemini: { id: 'gemini', name: 'Gemini', Voice: GeminiVoice, account: geminiAccount, models: GEMINI_MODELS, pick: GEMINI_MODEL, freeModel: null, rate: GEMINI_RATE, play: Math.round(GEMINI_RATE * GEMINI_PITCH), defaultVoice: GEMINI_DEFAULT_VOICE, warmDelay: 15_000 },
+  cartesia: { id: 'cartesia', name: 'Cartesia', Voice: CartesiaVoice, account: cartesiaAccount, models: CARTESIA_MODELS, pick: CARTESIA_MODEL, freeModel: null, rate: CARTESIA_RATE, defaultVoice: CARTESIA_DEFAULT_VOICE, sayFallback: true },
 };
 
 // Silence trimmed from both ends (a little kept), so a beat starts the moment it plays.
@@ -74,16 +78,17 @@ export function bundledBeats(dir = path.join(path.dirname(fileURLToPath(import.m
 }
 
 // What the overlay says when a reply's voice fails (onProblem's argument): the service's own reason when there is one.
-export const voiceWhy = (message) => String(message ?? '').replace(/^(Gemini|Fish Audio):\s*/, '').replace(/[.\s]+$/, '');
+export const voiceWhy = (message) => String(message ?? '').replace(/^(Gemini|Fish Audio|Cartesia):\s*/, '').replace(/[.\s]+$/, '');
 export function voiceProblemText(what, name) {
   if (what === 'key') return `My ${name} key isn't working, so replies are text for now.`;
+  if (what === 'quota') return `My ${name} credits ran out, so I'm using this Mac's built-in voice for now.`;
   const why = typeof what === 'string' ? voiceWhy(what) : '';
   return why ? `My voice isn't working right now: ${why}. Replies are text for now.` : "My voice isn't working right now, so replies are text for now.";
 }
 
 // beatStore: { read(name), write(name, data) }, where beats made here are kept between runs (none: made again each run).
-export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, FishVoiceImpl = FishVoice, account = fishAccount, providers = {}, beatPhrases = BEATS, bundled = bundledBeats(), beatStore = null, LocalVoiceImpl = StudioVoice, localStatus = studioStatus, prewarmMs = PREWARM_MS,
-  keepWarmMs = KEEP_WARM_MS, keepWarmIdleMs = KEEP_WARM_IDLE_MS, studioQuietMs = STUDIO_QUIET_MS, now = () => Date.now(), setTimer = (f, ms) => setTimeout(f, ms), clearTimer = (h) => clearTimeout(h) }) {
+export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, FishVoiceImpl = FishVoice, account = fishAccount, providers = {}, beatPhrases = BEATS, bundled = bundledBeats(), beatStore = null, LocalVoiceImpl = StudioVoice, localStatus = studioStatus, SayVoiceImpl = SayVoice, prewarmMs = PREWARM_MS,
+  keepWarmMs = KEEP_WARM_MS, keepWarmIdleMs = KEEP_WARM_IDLE_MS, studioQuietMs = STUDIO_QUIET_MS, now = () => Date.now(), setTimer = (f, ms) => setTimeout(f, ms), clearTimer = (h) => clearTimeout(h), sayPlatform = process.platform } = {}) {
   const all = { ...PROVIDERS, fish: { ...PROVIDERS.fish, Voice: FishVoiceImpl, account }, ...providers };
   let P = all.fish; // the service in use
   let key = null, voice = P.defaultVoice, pref = P.pick ?? P.models[0], model = pref, seq = 0, current = null, checking = null;
@@ -282,6 +287,40 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
     return w.v;
   }
 
+  // Cartesia → macOS say for this reply only. Does not change the selected provider.
+  function startSayFallback(me, { id, said, ended, reason }) {
+    log('speech_say_fallback', { id, reason });
+    onProblem(reason === 'quota' ? 'quota' : reason === 'key' ? 'key' : `Cartesia unavailable (${reason}); using this Mac's voice.`);
+    let heard = false, done = false, v = null;
+    const finish = (whole = false) => {
+      if (done) return;
+      done = true;
+      const chars = whole && heard ? said.join(' ').replace(/\[[^\]]*\]/g, '').length : 0;
+      emit({ kind: 'speech', id, end: true, ...(chars ? { chars } : {}) });
+      if (current === me) current = null;
+    };
+    v = new SayVoiceImpl({
+      platform: sayPlatform,
+      onAudio: (pcm, rate) => {
+        if (done) return;
+        heard = true;
+        emit({ kind: 'speech', id, rate: rate || SAY_RATE, pcm: Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength).toString('base64') });
+      },
+      onEnd: () => finish(true),
+      onError: (err) => {
+        if (done) return;
+        log('speech_error', { id, provider: 'say', heard: !!err.heard, message: err.message });
+        finish();
+      },
+    });
+    me.say = (s) => { if (done) return; said.push(s); v.say(s); };
+    me.end = () => { if (!done) v.end(); };
+    me.abort = () => { if (done) return; done = true; v?.abort(); if (current === me) current = null; };
+    v.open?.();
+    for (const s of said) v.say(s);
+    if (ended) v.end();
+  }
+
   /** A new reply's voice, its socket opening now. say(sentence) as they come, then end(). */
   function start() {
     if (localOn) return startLocal();
@@ -335,12 +374,16 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
         onEnd: () => finish(true),
         onError: async (err) => {
           if (done) return;
-          log('speech_error', { id, model: m, heard: err.heard, message: err.message });
+          log('speech_error', { id, model: m, heard: err.heard, message: err.message, reason: err.reason });
           if (!err.heard && !heard) {
             // Is it the key? Asked whether or not there's another model to try (Gemini has just the one).
             const a = await check();
             if (done) return;
-            if (!a.ok && a.reason === 'key') { onProblem('key'); return finish(); }
+            if (!a.ok && a.reason === 'key') {
+              // Cartesia only: fall back to macOS say when credits/key fail — never Fish/Gemini.
+              if (P.sayFallback && sayPlatform === 'darwin') return startSayFallback(me, { id, said, ended, reason: a.reason === 'quota' ? 'quota' : 'key' });
+              onProblem('key'); return finish();
+            }
             if (tries < chain().length) {
               // Retry: the free tier when there's no credit, else the next model down (the free one again once at the bottom).
               const c = chain();
@@ -350,7 +393,11 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
               if (ended) v.end();
               return;
             }
-            onProblem(err.message);
+            if (P.sayFallback && sayPlatform === 'darwin' && ['quota', 'key', 'network'].includes(err.reason || a.reason || '')) {
+              return startSayFallback(me, { id, said, ended, reason: err.reason || a.reason || 'network' });
+            }
+            if (P.sayFallback && (err.reason === 'quota' || a.reason === 'quota')) onProblem('quota');
+            else onProblem(err.message);
           }
           finish();
         },
