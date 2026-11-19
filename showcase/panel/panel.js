@@ -727,24 +727,49 @@
       ) : null,
     ];
   }
-  const TTS_NAMES = { fish: 'Fish Audio', gemini: 'Gemini', cartesia: 'Cartesia', voicestudio: 'VoiceStudio' };
+  const TTS_NAMES = {
+    chain: 'Fallback chain', elevenlabs: 'ElevenLabs', cartesia: 'Cartesia', microsoft: 'Microsoft Speech',
+    openrouter: 'OpenRouter speech', say: 'macOS Say', fish: 'Fish Audio', gemini: 'Gemini', voicestudio: 'VoiceStudio',
+  };
   function speakingPage() {
-    // The service that speaks, each with its own key: Fish Audio's voice is the look's and it has models to pick
-    // from; Gemini has a list of voices and two models; VoiceStudio runs on this computer and needs no key.
-    const tts = TTS_NAMES[state.tts] ? state.tts : 'fish', T = TTS_NAMES[tts], local = tts === 'voicestudio', hasKey = local || !!state[`${tts}Key`];
-    // Gemini can speak with the key the AI already has (the Model page), until the voice gets one of its own.
-    const shared = tts === 'gemini' && hasKey && !!state.geminiShared;
+    // Prefer the fallback chain (ElevenLabs → Cartesia → Microsoft → say). Other providers stay available.
+    const tts = TTS_NAMES[state.tts] ? state.tts : 'chain', T = TTS_NAMES[tts], local = tts === 'voicestudio', chain = tts === 'chain';
+    const noKey = local || tts === 'say' || chain;
+    const hasKey = noKey || !!state[`${tts}Key`];
+    const shared = (tts === 'gemini' || tts === 'openrouter') && hasKey && !!state[`${tts === 'openrouter' ? 'openrouter' : 'gemini'}Shared`];
+    const labels = state.voiceChainLabels || {};
+    const order = state.voiceChain || ['elevenlabs', 'cartesia', 'microsoft', 'say'];
     return [
       group('Spoken replies', 'Hear me as well as read me.', null,
         picks('Replies', [['text', 'Text only'], ['voice', 'Voice and text']], state.replies, (x) => {
-          if (x === 'voice' && !hasKey) { ui.key = tts; render(`key-${tts}`); note(`Add a ${T} key to hear me talk.`); return; }
+          if (x === 'voice' && !hasKey && !chain) { ui.key = tts; render(`key-${tts}`); note(`Add a ${T} key to hear me talk.`); return; }
           act(`replies:${x}`);
-        }, 'replies', { text: 'I answer in writing only.', voice: `I say my answers out loud too, in the voice below${hasKey ? '' : `. Needs a ${T} key`}.` }),
+        }, 'replies', { text: 'I answer in writing only.', voice: `I say my answers out loud too${hasKey || chain ? '' : `. Needs a ${T} key`}.` }),
         el('p', { className: 'sub', textContent: 'Voice provider' }),
         picks('Voice provider', Object.entries(TTS_NAMES), tts, (x) => {
-          if (x !== 'voicestudio' && !state[`${x}Key`]) { ui.key = x; note(`Add a ${TTS_NAMES[x]} key to hear me talk.`); } // its key field opens with it
+          if (x !== 'voicestudio' && x !== 'say' && x !== 'chain' && !state[`${x}Key`]) { ui.key = x; note(`Add a ${TTS_NAMES[x]} key to hear me talk.`); }
           act(`tts:${x}`);
-        }, 'tts', { fish: 'A voice for each look, acted out with feeling. Billed to your Fish Audio account.', gemini: "Google's voices: pick one of 30. Billed to your Google AI Studio account.", cartesia: 'Cartesia Sonic voices. If credits run out on a Mac, falls back to the built-in say voice.', voicestudio: 'The free VoiceStudio app on this computer, in the engine and voices you set up there. Nothing leaves your computer.' }),
+        }, 'tts', {
+          chain: 'Try providers in order until one works. Default: ElevenLabs → Cartesia → Microsoft → macOS Say.',
+          elevenlabs: 'ElevenLabs streaming voices.', cartesia: 'Cartesia Sonic. Credits can fall back down the chain.',
+          microsoft: 'Azure Speech (save key as REGION|KEY).', openrouter: 'OpenRouter /api/v1/audio/speech models.',
+          say: 'Built-in macOS say (no key).', fish: 'Fish Audio, acted out with feeling.',
+          gemini: "Google's voices.", voicestudio: 'Local VoiceStudio app.',
+        }),
+        chain ? el('div', { className: 'reveal', 'data-anim': 'voice-chain' },
+          el('p', { className: 'sub', textContent: 'Fallback order' }),
+          el('p', { className: 'why wrap', textContent: `Active now: ${labels[state.activeVoice] || state.activeVoice || '—'}. Reorder or toggle providers below.` }),
+          ...order.map((id, i) => el('div', { className: 'setting' },
+            el('span', {}, `${i + 1}. ${labels[id] || id}`, el('small', { textContent: id === 'say' ? 'No key' : (state[`${id}Key`] ? 'Key ready' : 'Needs key') })),
+            el('span', { className: 'row-btns' },
+              link('↑', () => act(`voicechain:up:${id}`), { k: `vcup:${id}`, aria: `Move ${id} up`, disabled: i === 0 }),
+              link('↓', () => act(`voicechain:down:${id}`), { k: `vcdn:${id}`, aria: `Move ${id} down`, disabled: i === order.length - 1 }),
+              id !== 'say' ? link(state[`${id}Key`] ? 'Key' : 'Add key', () => toggleKey(id), { k: `addkey:${id}` }) : null))),
+          el('p', { className: 'sub', textContent: 'Also available' }),
+          el('div', { className: 'links' },
+            ...['openrouter', 'elevenlabs', 'cartesia', 'microsoft'].filter((id) => !order.includes(id)).map((id) =>
+              link(`+ ${labels[id] || id}`, () => act(`voicechain:toggle:${id}`), { k: `vct:${id}` }))),
+        ) : null,
         local ? el('div', { className: 'reveal', 'data-anim': 'studio' }, studioRows()) : null,
         local ? el('div', { className: 'reveal', 'data-anim': 'studio-speak' },
           el('p', { className: 'sub', textContent: 'How much it speaks' }),
@@ -768,12 +793,30 @@
             Object.fromEntries(state.fishModels.map((c) => [c.id, `${WHY_LONG[c.id] ?? ''} ${price(c)}`.trim()]))),
           el('p', { className: `why${state.fishFree ? ' late' : ''}`, textContent: state.fishFree ? "No credit left, so it's on Fish's free tier" : WHY[state.fishModel] ?? '' }),
         ) : null,
-        local ? null : el('div', { className: 'setting' },
-          el('span', {}, `${T} key`, el('small', { textContent: shared ? 'Shared with the Model page' : hasKey ? `Saved in ${where()}` : 'Needed for spoken replies' })),
+        (tts === 'cartesia' || (chain && order.includes('cartesia'))) && state.cartesiaModels?.length ? el('div', { className: 'reveal', 'data-anim': 'cartesia-model' },
+          el('p', { className: 'sub', textContent: 'Cartesia model' }),
+          picks('Cartesia model', state.cartesiaModels.map((c) => [c.id, c.name]), state.cartesiaModel, (x) => act(`cartesiamodel:${x}`), 'cartesiamodel'),
+        ) : null,
+        (tts === 'elevenlabs' || (chain && order.includes('elevenlabs'))) && state.elevenlabsModels?.length ? el('div', { className: 'reveal', 'data-anim': 'eleven-model' },
+          el('p', { className: 'sub', textContent: 'ElevenLabs model' }),
+          picks('ElevenLabs model', state.elevenlabsModels.map((c) => [c.id, c.name]), state.elevenlabsModel, (x) => act(`elevenlabsmodel:${x}`), 'elevenlabsmodel'),
+        ) : null,
+        (tts === 'openrouter' || (chain && order.includes('openrouter'))) && state.openrouterSpeechModels?.length ? el('div', { className: 'reveal', 'data-anim': 'or-speech' },
+          el('p', { className: 'sub', textContent: 'OpenRouter speech model' }),
+          picks('OpenRouter speech', state.openrouterSpeechModels.map((c) => [c.id, c.name]), state.openrouterSpeechModel, (x) => act(`openrouterspeech:${x}`), 'orspeech'),
+          el('div', { className: 'links' }, link('Refresh model list', () => act('openrouterspeech_refresh'), { k: 'orspeech_refresh' })),
+        ) : null,
+        !local && !chain && tts !== 'say' ? el('div', { className: 'setting' },
+          el('span', {}, `${T} key`, el('small', { textContent: shared ? 'Shared with the Model page' : hasKey ? `Saved in ${where()}` : (tts === 'microsoft' ? 'REGION|KEY' : 'Needed for spoken replies') })),
           el('span', { className: 'row-btns' },
             link(ui.key === tts ? 'Cancel' : shared ? 'Use another' : hasKey ? 'Change' : 'Add', () => toggleKey(tts), { k: `addkey:${tts}`, aria: hasKey ? `Change the ${T} key` : `Add a ${T} key` }),
-            hasKey && !shared && ui.key !== tts ? armed('Remove', 'Confirm', `${tts}key-remove`, `${tts}key_remove`, `Remove the ${T} key`) : null)),
-        local ? null : keyForm(tts, T, (key) => send({ type: `panel_${tts}key`, key }))),
+            hasKey && !shared && ui.key !== tts ? armed('Remove', 'Confirm', `${tts}key-remove`, `${tts}key_remove`, `Remove the ${T} key`) : null)) : null,
+        !local && !chain && tts !== 'say' ? keyForm(tts, T, (key) => send({ type: `panel_${tts}key`, key })) : null,
+        // Per-provider key forms while editing from the chain list
+        chain && ui.key && ui.key !== 'say' ? keyForm(ui.key, TTS_NAMES[ui.key] || ui.key, (key) => send({ type: `panel_${ui.key}key`, key })) : null,
+        toggle('Protect extensions', 'Block automatic in-app updates so fork extras (voice chain, self-configure) are not overwritten. Merge upstream via git instead.', !!state.protectExtensions, () => act('protectextensions'), 'protectextensions'),
+        toggle('Self-configure', 'Let me change a whitelist of settings when you ask (voice chain, flags). Never edits source code.', !!state.selfConfigure, () => act('selfconfigure'), 'selfconfigure'),
+      ),
     ];
   }
   // Which mic I listen on (from #59, by overspend1): automatic (the system's default, or on a Mac the built-in mic while

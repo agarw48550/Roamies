@@ -46,4 +46,8 @@ for (const name of process.argv.slice(2)) copy(name, process.cwd());
 EOF
 # The recorded beats (beats/make.mjs): the audio and its index, not the script.
 mkdir -p dist/beats && cp beats/index.json beats/*.pcm dist/beats/
+# Screen-memory helper runs as its own Node process next to the bundled sidekick (spawnScreenmemHelper).
+cp screenmem-helper.mjs screenmem.mjs dist/
+# EXTENSION: fork extras are imported from the bundle; copy the tree beside sidekick.mjs.
+rm -rf dist/extensions && cp -R extensions dist/extensions
 echo '{"type":"module"}' > dist/package.json

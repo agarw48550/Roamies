@@ -78,7 +78,7 @@ export function bundledBeats(dir = path.join(path.dirname(fileURLToPath(import.m
 }
 
 // What the overlay says when a reply's voice fails (onProblem's argument): the service's own reason when there is one.
-export const voiceWhy = (message) => String(message ?? '').replace(/^(Gemini|Fish Audio|Cartesia):\s*/, '').replace(/[.\s]+$/, '');
+export const voiceWhy = (message) => String(message ?? '').replace(/^(Gemini|Fish Audio|Cartesia|ElevenLabs|Microsoft Speech|OpenRouter speech):\s*/, '').replace(/[.\s]+$/, '');
 export function voiceProblemText(what, name) {
   if (what === 'key') return `My ${name} key isn't working, so replies are text for now.`;
   if (what === 'quota') return `My ${name} credits ran out, so I'm using this Mac's built-in voice for now.`;
@@ -87,8 +87,10 @@ export function voiceProblemText(what, name) {
 }
 
 // beatStore: { read(name), write(name, data) }, where beats made here are kept between runs (none: made again each run).
+// EXTENSION: getFallbacks() → remaining provider ids; resolveFallback(id) → { key, voice, model } | null to try next.
 export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, FishVoiceImpl = FishVoice, account = fishAccount, providers = {}, beatPhrases = BEATS, bundled = bundledBeats(), beatStore = null, LocalVoiceImpl = StudioVoice, localStatus = studioStatus, SayVoiceImpl = SayVoice, prewarmMs = PREWARM_MS,
-  keepWarmMs = KEEP_WARM_MS, keepWarmIdleMs = KEEP_WARM_IDLE_MS, studioQuietMs = STUDIO_QUIET_MS, now = () => Date.now(), setTimer = (f, ms) => setTimeout(f, ms), clearTimer = (h) => clearTimeout(h), sayPlatform = process.platform } = {}) {
+  keepWarmMs = KEEP_WARM_MS, keepWarmIdleMs = KEEP_WARM_IDLE_MS, studioQuietMs = STUDIO_QUIET_MS, now = () => Date.now(), setTimer = (f, ms) => setTimeout(f, ms), clearTimer = (h) => clearTimeout(h), sayPlatform = process.platform,
+  getFallbacks = () => [], resolveFallback = async () => null } = {}) {
   const all = { ...PROVIDERS, fish: { ...PROVIDERS.fish, Voice: FishVoiceImpl, account }, ...providers };
   let P = all.fish; // the service in use
   let key = null, voice = P.defaultVoice, pref = P.pick ?? P.models[0], model = pref, seq = 0, current = null, checking = null;
@@ -145,6 +147,7 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
 
   // Returns the account check: { ok, credit } or { ok: false, reason: 'key' | 'network' }.
   async function check() {
+    if (P.noKey) return pAccountNoKey();
     if (!key) return { ok: false, reason: 'key' };
     if (checking) return checking;
     const p = P;
@@ -157,6 +160,12 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
       return a;
     }).finally(() => { if (checking === mine) checking = null; });
     return mine;
+  }
+  async function pAccountNoKey() {
+    const p = P;
+    const a = await p.account(null).catch(() => ({ ok: false, reason: 'network' }));
+    log(`${p.id}_account`, { ok: a.ok, reason: a.reason });
+    return a;
   }
 
   function stopAll() {
@@ -324,10 +333,12 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
   /** A new reply's voice, its socket opening now. say(sentence) as they come, then end(). */
   function start() {
     if (localOn) return startLocal();
-    if (!key) return null;
+    // EXTENSION: noKey providers (macOS say) speak without a saved API key.
+    if (!key && !P.noKey) return null;
     stopAll();
     const id = `s${++seq}`, said = [];
     let ended = false, tries = 0, v = null, heard = false, done = false, beat = false, t0 = Date.now();
+    let fallbackCursor = 0;
     // The face follows the voice: a sentence whose feeling differs from the last one's (speech.mjs cueFeel) is marked
     // with where it starts, in characters spoken so far (cues left out); the overlay times it by the audio played.
     let spoken = 0, feel = null;
@@ -379,10 +390,35 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
             // Is it the key? Asked whether or not there's another model to try (Gemini has just the one).
             const a = await check();
             if (done) return;
-            if (!a.ok && a.reason === 'key') {
-              // Cartesia only: fall back to macOS say when credits/key fail — never Fish/Gemini.
+            const tryChainFallback = async (reason) => {
+              // EXTENSION: next provider in the user's fallback chain (ElevenLabs → Cartesia → … → say).
+              const fb = getFallbacks()?.slice(fallbackCursor) ?? [];
+              for (let i = 0; i < fb.length; i++) {
+                const setup = await resolveFallback(fb[i]);
+                if (done) return true;
+                if (!setup || !all[fb[i]]) continue;
+                const nextP = all[fb[i]];
+                if (!setup.key && !nextP.noKey) continue;
+                fallbackCursor += i + 1;
+                log('speech_provider_fallback', { id, from: P.id, to: nextP.id, reason });
+                P = nextP;
+                key = setup.key || null;
+                voice = setup.voice ?? nextP.defaultVoice;
+                pref = setup.model ?? nextP.pick ?? nextP.models[0];
+                model = pref;
+                tries = 0;
+                connect(model);
+                for (const s of said) v.say(s);
+                if (ended) v.end();
+                return true;
+              }
+              return false;
+            };
+            if (!a.ok && (a.reason === 'key' || a.reason === 'quota')) {
+              if (await tryChainFallback(a.reason)) return;
+              // Cartesia legacy: fall back to macOS say when credits/key fail — never Fish/Gemini.
               if (P.sayFallback && sayPlatform === 'darwin') return startSayFallback(me, { id, said, ended, reason: a.reason === 'quota' ? 'quota' : 'key' });
-              onProblem('key'); return finish();
+              onProblem(a.reason === 'quota' ? 'quota' : 'key'); return finish();
             }
             if (tries < chain().length) {
               // Retry: the free tier when there's no credit, else the next model down (the free one again once at the bottom).
@@ -393,6 +429,7 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
               if (ended) v.end();
               return;
             }
+            if (await tryChainFallback(err.reason || a.reason || 'network')) return;
             if (P.sayFallback && sayPlatform === 'darwin' && ['quota', 'key', 'network'].includes(err.reason || a.reason || '')) {
               return startSayFallback(me, { id, said, ended, reason: err.reason || a.reason || 'network' });
             }
@@ -414,7 +451,12 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
   }
 
   return {
-    setKey(k) { if (localOn) return; if ((k || null) !== key) { beats = new Map(); dropPrewarm(); if (!k) stopAll(); } key = k || null; if (key) check(); },
+    setKey(k) {
+      if (localOn) return;
+      if ((k || null) !== key) { beats = new Map(); dropPrewarm(); if (!k && !P.noKey) stopAll(); }
+      key = k || null;
+      if (key || P.noKey) check();
+    },
     // The user's pick. Beats are remade in it; with no credit it stays on the free tier until there is some.
     setModel(m) {
       if (!P.models.includes(m) || m === P.freeModel || m === pref) return;
@@ -465,7 +507,7 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
     checkLocal,
     get ready() { return beats.size + beatPhrases.filter((p) => !beats.has(p) && shipped()?.has(p)).length; },
     get model() { return model; },
-    get on() { return localOn || !!key; },
+    get on() { return localOn || !!key || !!P.noKey; },
     check,
     start,
     prewarm,

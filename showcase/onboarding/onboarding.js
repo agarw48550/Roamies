@@ -496,6 +496,7 @@
   const TTS = {
     fish: { name: 'Fish Audio', link: FISH_URL, get: 'Get a free key (affiliate link)', note: 'Spoken replies are billed to your own Fish Audio account.', send: 'ob_fishkey' },
     gemini: { name: 'Gemini', link: 'https://aistudio.google.com/apikey', get: 'Get a free key', note: 'Spoken replies are billed to your own Google AI Studio account.', send: 'ob_geminikey' },
+    cartesia: { name: 'Cartesia', link: 'https://play.cartesia.ai/', get: 'Get a key', note: 'Spoken replies are billed to your own Cartesia account. On a Mac, if credits run out it falls back to the built-in say voice.', send: 'ob_cartesiakey' },
     voicestudio: { name: 'VoiceStudio', local: true },
   };
   // A row on this step coming or going: grows into its room and fades in, or the reverse, rather than popping.
@@ -1379,11 +1380,12 @@
           window.__onboard?.({ kind: 'login', provider: m.provider, phase: 'done' }); window.__onboard?.({ ...st });
         }, 900);
       } else if (m.type === 'ob_replies') { st.replies = m.mode; reply({ ...st }); reply({ kind: 'say', text: m.mode === 'voice' ? 'Voice is on!' : 'Text only from now on.' }, 50); }
-      else if (m.type === 'ob_fishkey' || m.type === 'ob_geminikey') {
+      else if (m.type === 'ob_fishkey' || m.type === 'ob_geminikey' || m.type === 'ob_cartesiakey') {
         // A key of "bad" is refused, like a wrong one.
-        const p = m.type === 'ob_geminikey' ? 'gemini' : 'fish';
+        const p = m.type === 'ob_geminikey' ? 'gemini' : m.type === 'ob_cartesiakey' ? 'cartesia' : 'fish';
+        const site = p === 'gemini' ? 'aistudio.google.com' : p === 'cartesia' ? 'cartesia.ai' : 'fish.audio';
         setTimeout(() => {
-          if (m.key === 'bad') return window.__onboard?.({ kind: 'fish', ok: false, error: `That key didn't work. Copy it again from ${p === 'gemini' ? 'aistudio.google.com' : 'fish.audio'} and retry.` });
+          if (m.key === 'bad') return window.__onboard?.({ kind: 'fish', ok: false, error: `That key didn't work. Copy it again from ${site} and retry.` });
           Object.assign(st, { [`${p}Key`]: true, tts: p, replies: 'voice' }); window.__onboard?.({ kind: 'fish', ok: true }); window.__onboard?.({ ...st });
         }, 900);
       } else if (m.type === 'ob_tts') {

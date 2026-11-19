@@ -52,6 +52,12 @@ import { DEFAULT_VOICE, FISH_CHOICES } from './fish.mjs';
 import { GEMINI_CHOICES, GEMINI_DEFAULT_VOICE, GEMINI_LOOK_VOICES, GEMINI_MODEL, GEMINI_VOICES } from './gemini.mjs';
 import { CARTESIA_CHOICES, DEFAULT_VOICE as CARTESIA_DEFAULT_VOICE } from './cartesia.mjs';
 import { createSecrets, retryLoad, runInput } from './secrets.mjs';
+// EXTENSION: fork extras (voice chain, self-configure). Keep under ./extensions so upstream merges stay clean.
+import {
+  CHAIN_LABELS, DEFAULT_VOICE_CHAIN, EXTENSION_TTS_META, ELEVEN_CHOICES, ELEVEN_DEFAULT_VOICE, ELEVEN_MODEL,
+  MS_CHOICES, MS_DEFAULT_VOICE, MS_MODEL, OR_SPEECH_CHOICES, OR_SPEECH_DEFAULT_VOICE, OR_SPEECH_MODEL,
+  createSelfConfigTool, extensionProviders, listOpenrouterSpeechModels, normalizeVoiceChain,
+} from './extensions/index.mjs';
 import { showTrayIcon } from './wintray.mjs';
 import { createActivity } from './activity.mjs';
 import { canCircle, canSnap, cleanMics, talkChords, hasHands, hasHotkeys, hasVoice, linuxSession, micTrouble, needsVoiceModel, platformLine, samePair, seesPointer, writeChord, writeChords } from './platform.mjs';
@@ -128,7 +134,7 @@ const DEFAULTS = {
   onboarded: false, onboardStep: 0, filesAsked: false, keys: DEFAULT_KEYS, muteWhileTalking: true, autoListen: false, listenEvery: false, listenSecs: 8, lite: false, wakeWord: false, setupVersion: 0, size: 'default', look: 'classic', introDone: false,
   replies: 'text', // 'voice': spoken (with Fish Audio or Gemini) as well as shown
   speechLang: 'auto', // the language talking is recognised in (macOS): 'auto' follows the Mac's language list, or a locale like 'ar-SA'
-  tts: 'fish', // which one speaks: 'fish' (Fish Audio), 'gemini', 'cartesia' or 'voicestudio' (the VoiceStudio app on this computer)
+  tts: 'chain', // EXTENSION: 'chain' uses voiceChain fallbacks; also fish/gemini/cartesia/elevenlabs/microsoft/openrouter/say/voicestudio
   studioSpeak: 'short', // how much VoiceStudio says out loud: 'short', 'medium' or 'full' (it renders slower than real time)
   studioVoices: {}, // look → its VoiceStudio voice (a saved profile id; none: the selected engine's default voice)
   fishModel: FISH_CHOICES[0].id, // Drama 3 (most expressive) or S2.1 Pro (natural pace, cheaper)
@@ -137,6 +143,16 @@ const DEFAULTS = {
   // --- opt-in addons (all default off; existing installs unchanged) ---
   cartesiaVoice: CARTESIA_DEFAULT_VOICE,
   cartesiaModel: CARTESIA_CHOICES[0].id,
+  // EXTENSION: ordered TTS fallbacks + new providers
+  voiceChain: [...DEFAULT_VOICE_CHAIN],
+  elevenlabsVoice: ELEVEN_DEFAULT_VOICE,
+  elevenlabsModel: ELEVEN_MODEL,
+  microsoftVoice: MS_DEFAULT_VOICE,
+  microsoftRegion: 'eastus',
+  openrouterSpeechModel: OR_SPEECH_MODEL,
+  openrouterSpeechVoice: OR_SPEECH_DEFAULT_VOICE,
+  protectExtensions: true, // skip automatic in-app updates that would wipe fork extras
+  selfConfigure: true, // allow configure_self tool
   lowMemoryMode: false, // M2 8GB resource guard
   wakeRelisten: false, // brief mic reopen after a spoken reply (with autoListen patterns)
   screenMemory: false, // Localbird-style continuous screen memory
@@ -210,6 +226,11 @@ let shellInfo = null; // resolves the shell's reply to it: screens, tray, panel,
     if (config[one]) config[each] = { [config.look ?? 'classic']: config[one], ...config[each] };
     delete config[one];
   }
+  // EXTENSION: keep the fallback list valid across upgrades.
+  config.voiceChain = normalizeVoiceChain(config.voiceChain);
+  if (config.tts && !['chain', 'fish', 'gemini', 'cartesia', 'elevenlabs', 'microsoft', 'openrouter', 'say', 'voicestudio'].includes(config.tts)) {
+    config.tts = 'chain';
+  }
 }
 // Hybrid models (route.mjs): while a heavy job runs on its own model, config.provider and config.model hold that model
 // and `defaultPick` holds the user's default. Only the default is ever saved.
@@ -227,22 +248,43 @@ const TTS = {
   cartesia: { id: 'cartesia', name: 'Cartesia', secret: 'cartesia', site: 'cartesia.ai' },
   // On this computer: no key, never falls back to a paid service when it isn't running.
   voicestudio: { id: 'voicestudio', name: 'VoiceStudio', local: true },
+  // EXTENSION
+  ...EXTENSION_TTS_META,
 };
-const tts = () => TTS[config.tts] ?? TTS.fish;
-// Which have a key to speak with: 'own' (saved for the voice), 'shared' (Gemini only: the AI's Gemini key, from the
-// Model page, when no key was saved just for the voice) or false. For the one in use, speech.on says.
-const ttsKeys = { fish: false, gemini: false, cartesia: false };
-const hasVoiceKey = (id) => (id === tts().id ? speech.on : !!ttsKeys[id]);
+const voiceChainNow = () => normalizeVoiceChain(config.voiceChain);
+const tts = () => {
+  if (config.tts === 'chain') return { id: 'chain', name: 'Fallback chain', chain: true };
+  return TTS[config.tts] ?? TTS.chain;
+};
+// Which have a key to speak with: 'own' (saved for the voice), 'shared' (Gemini / OpenRouter from Model page) or false.
+const ttsKeys = { fish: false, gemini: false, cartesia: false, elevenlabs: false, microsoft: false, openrouter: false, say: false };
+const hasVoiceKey = (id) => {
+  if (id === 'chain') return voiceChainNow().some((x) => x === 'say' || !!ttsKeys[x] || (x === ttsActive() && speech.on));
+  if (id === 'say') return process.platform === 'darwin';
+  return (id === speech.provider ? speech.on : !!ttsKeys[id]);
+};
+const ttsActive = () => (config.tts === 'chain' ? (speech.provider || voiceChainNow()[0]) : config.tts);
 // The key the AI uses for Gemini, if it's an API key (the same Google AI Studio key speaks too).
 const brainGeminiKey = () => auth.resolveApiKey('gemini').then((c) => c?.accessToken || null).catch(() => null);
+const brainOpenrouterKey = () => auth.resolveApiKey('openrouter').then((c) => c?.accessToken || null).catch(() => null);
 // A service's key and which kind it is. Throws while the secret store can't be read.
 async function voiceKey(id) {
+  if (id === 'say' || TTS[id]?.noKey) return [null, 'own'];
+  if (id === 'chain' || !TTS[id]?.secret) return [null, false];
   // Linux: reading the keyring can pop up an "unlock your keyring" dialog (an auto-login desktop leaves it locked),
   // so it's only read once a key has been saved there (fishKeySaved, geminiKeySaved).
   const own = LINUX && !config[`${id}KeySaved`] ? null : await secrets.get(TTS[id].secret);
   if (own) return [own, 'own'];
-  const shared = id === 'gemini' ? await brainGeminiKey() : null;
-  return shared ? [shared, 'shared'] : [null, false];
+  if (id === 'gemini') {
+    const shared = await brainGeminiKey();
+    return shared ? [shared, 'shared'] : [null, false];
+  }
+  // EXTENSION: OpenRouter speech can reuse the Model-page OpenRouter key.
+  if (id === 'openrouter') {
+    const shared = await brainOpenrouterKey();
+    return shared ? [shared, 'shared'] : [null, false];
+  }
+  return [null, false];
 }
 const secrets = createSecrets({ hands: process.env.ROAMIES_HANDS || '', dataDir: path.join(path.dirname(CONFIG_PATH), 'sidekick') });
 let voiceProblemAt = 0;
@@ -253,6 +295,18 @@ const speech = createSpeaker({
   beatStore: { read: (name) => readJson(path.join(BEAT_DIR, `${name}.json`)), write: (name, data) => writeJson(path.join(BEAT_DIR, `${name}.json`), data) },
   emit: (m) => ui(m),
   log: (kind, data) => logLine(kind, data),
+  // EXTENSION: register ElevenLabs / Microsoft / OpenRouter speech / say
+  providers: extensionProviders({ microsoftRegion: () => config.microsoftRegion }),
+  getFallbacks: () => {
+    if (config.tts !== 'chain') return config.tts === 'say' ? [] : (process.platform === 'darwin' ? ['say'] : []);
+    const chain = voiceChainNow();
+    const i = chain.indexOf(speech.provider);
+    return i < 0 ? chain.slice(1) : chain.slice(i + 1);
+  },
+  resolveFallback: async (id) => {
+    const setup = await providerSetup(id);
+    return setup;
+  },
   // Once in a while, not on every reply: the text is there either way.
   onProblem: (what) => {
     // VoiceStudio: said once a minute at most (it's local, so the reason is something they can fix now).
@@ -274,32 +328,76 @@ async function syncGeminiVoiceKey() {
   if (tts().id === 'gemini') await useTts('gemini');
   else ttsKeys.gemini = (await voiceKey('gemini').catch(() => [null, false]))[1];
 }
+/** EXTENSION: voice/model for a provider id (used by chain fallbacks and aimSpeaker). */
+async function providerSetup(id) {
+  if (id === 'say') return process.platform === 'darwin' ? { key: null, voice: null, model: 'say' } : null;
+  if (!TTS[id] || id === 'chain' || id === 'voicestudio') return null;
+  const [key, kind] = await voiceKey(id).catch(() => [null, false]);
+  if (!key && !TTS[id].noKey) return null;
+  ttsKeys[id] = kind;
+  if (id === 'gemini') return { key, voice: geminiVoice(), model: config.geminiModel };
+  if (id === 'cartesia') return { key, voice: config.cartesiaVoice || CARTESIA_DEFAULT_VOICE, model: config.cartesiaModel };
+  if (id === 'elevenlabs') return { key, voice: config.elevenlabsVoice || ELEVEN_DEFAULT_VOICE, model: config.elevenlabsModel || ELEVEN_MODEL };
+  if (id === 'microsoft') return { key, voice: config.microsoftVoice || MS_DEFAULT_VOICE, model: MS_MODEL };
+  if (id === 'openrouter') return { key, voice: config.openrouterSpeechVoice || OR_SPEECH_DEFAULT_VOICE, model: config.openrouterSpeechModel || OR_SPEECH_MODEL };
+  if (id === 'fish') return { key, voice: lookVoice(), model: config.fishModel };
+  return { key, voice: null, model: null };
+}
+/** First usable provider in the fallback chain (has key, or say on Mac). */
+async function pickChainProvider() {
+  for (const id of voiceChainNow()) {
+    const setup = await providerSetup(id);
+    if (!setup) continue;
+    if (id !== 'say') {
+      aimSpeaker(id);
+      speech.setKey(setup.key);
+      const a = await speech.check();
+      if (!a.ok) continue;
+    } else {
+      aimSpeaker('say');
+      speech.setKey(null);
+    }
+    return id;
+  }
+  return null;
+}
 // Point the speaker at a service, with its voice and model. Its key is set after (a change of service clears it).
 function aimSpeaker(id) {
+  if (id === 'chain') id = voiceChainNow()[0] || 'say';
   speech.setProvider(id);
   speech.setStudioSpeak?.(config.studioSpeak); // how much VoiceStudio says out loud
-  if (TTS[id]?.local) speech.setLocalVoice(studioVoice());
+  if (TTS[id]?.local && id === 'voicestudio') speech.setLocalVoice(studioVoice());
   else if (id === 'gemini') { speech.setVoice(geminiVoice()); speech.setModel(config.geminiModel); }
   else if (id === 'cartesia') { speech.setVoice(config.cartesiaVoice || CARTESIA_DEFAULT_VOICE); speech.setModel(config.cartesiaModel); }
+  else if (id === 'elevenlabs') { speech.setVoice(config.elevenlabsVoice || ELEVEN_DEFAULT_VOICE); speech.setModel(config.elevenlabsModel || ELEVEN_MODEL); }
+  else if (id === 'microsoft') { speech.setVoice(config.microsoftVoice || MS_DEFAULT_VOICE); speech.setModel(MS_MODEL); }
+  else if (id === 'openrouter') { speech.setVoice(config.openrouterSpeechVoice || OR_SPEECH_DEFAULT_VOICE); speech.setModel(config.openrouterSpeechModel || OR_SPEECH_MODEL); }
+  else if (id === 'say') { speech.setVoice(null); speech.setModel('say'); }
   else { speech.setVoice(lookVoice()); speech.setModel(config.fishModel); }
 }
 // The same, with its key: the one given, else the saved one.
 async function useTts(id, key) {
+  if (id === 'chain') {
+    const picked = await pickChainProvider();
+    return picked;
+  }
   aimSpeaker(id);
-  if (TTS[id]?.local) return;
+  if (TTS[id]?.local && id !== 'say') return;
+  if (id === 'say') { speech.setKey(null); return; }
   if (key === undefined) [key, ttsKeys[id]] = await voiceKey(id).catch(() => [null, false]);
   if (speech.provider === id) speech.setKey(key);
 }
-aimSpeaker(tts().id);
+useTts(config.tts === 'chain' ? 'chain' : tts().id).catch(() => aimSpeaker(config.tts === 'chain' ? 'say' : tts().id));
 // Read once, and again later if the keychain couldn't be read yet (locked at login, or its prompt unanswered): before,
 // one failed read left spoken replies off until the app restarted.
 const voiceKeysLoaded = retryLoad(async () => {
   for (const t of Object.values(TTS)) {
-    if (t.local) continue;
+    if (t.local || t.chain || t.noKey || !t.secret) continue;
     const [k, kind] = await voiceKey(t.id); // throws while the keychain can't be read, and is tried again later
     ttsKeys[t.id] = kind;
-    if (k && t === tts() && !speech.on) speech.setKey(k);
+    if (k && (config.tts === t.id || (config.tts === 'chain' && voiceChainNow()[0] === t.id)) && !speech.on) speech.setKey(k);
   }
+  if (config.tts === 'chain') await useTts('chain').catch(() => {});
   menu();
 }, { onError: (e) => console.error('voice key', e.message) });
 
@@ -698,6 +796,21 @@ const addonTools = createAddonTools({
   screenMemPaused: () => screenMemThrottle || !!config.paused,
 });
 tools.push(...addonTools.filter((t) => typeof t === 'object' && t.name));
+// EXTENSION: limited self-configure tool (whitelist only — never edits source).
+tools.push(createSelfConfigTool({
+  getConfig: () => config,
+  setConfig: (patch) => { Object.assign(config, patch); if (patch.voiceChain) config.voiceChain = normalizeVoiceChain(patch.voiceChain); saveConfig(); },
+  enabled: () => config.selfConfigure !== false,
+  userName,
+  afterSet: async (patch) => {
+    agentStale = true;
+    if (patch.tts || patch.voiceChain || patch.elevenlabsVoice || patch.elevenlabsModel || patch.cartesiaVoice || patch.cartesiaModel
+      || patch.microsoftVoice || patch.microsoftRegion || patch.openrouterSpeechModel || patch.openrouterSpeechVoice) {
+      await useTts(config.tts === 'chain' ? 'chain' : config.tts).catch(() => {});
+    }
+    menu();
+  },
+}));
 if (config.watchesOn) watchRunner.start();
 uninstallRelaunchWatcher(DATA_DIR); // clear any leftover safe-to-relaunch agent from a prior quit
 const resourceGuard = createResourceGuard({
@@ -714,12 +827,23 @@ const resourceGuard = createResourceGuard({
   },
 });
 if (config.lowMemoryMode && MAC) resourceGuard.start();
-if (config.screenMemory && !config.paused) {
+/** Spawn the screen-memory helper and start capture once it answers (spawn is async). */
+async function ensureScreenmem() {
+  if (!config.screenMemory || config.paused || !addonTools._screenmemControl) return;
   const helper = process.env.ROAMIES_SCREENMEM
     || path.join(path.dirname(fileURLToPath(import.meta.url)), 'screenmem-helper.mjs');
   spawnScreenmemHelper(helper, { dataDir: path.join(DATA_DIR, 'screenmem') });
-  addonTools._screenmemControl?.start?.().catch(() => {});
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    const s = await addonTools._screenmemControl.status().catch(() => null);
+    if (s?.ok) {
+      await addonTools._screenmemControl.start().catch(() => {});
+      if (screenMemThrottle) await addonTools._screenmemControl.configure({ paused: true }).catch(() => {});
+      return;
+    }
+  }
 }
+if (config.screenMemory && !config.paused) ensureScreenmem().catch(() => {});
 // Background agents (agents.mjs): each runs in its own process on the model picked when it starts.
 let turnImage = null; // the picture sent with the request being answered, for send_agent's "snap"
 const agents = createAgents({
@@ -1781,11 +1905,11 @@ async function setTts(id) {
   agentStale = true; // with no key for it yet, replies are written for bubbles until there is one
   await useTts(id);
   menu(); if (onboarding) obState();
-  if (TTS[id].local) {
+  if (id === 'voicestudio') {
     if (!(await studioReady())) return;
     if (!VOICE_ON()) return say('VoiceStudio is ready. Turn on Voice and text to hear it.', 'happy');
   }
-  if (VOICE_ON()) speakLine('This is how I sound.');
+  if (VOICE_ON()) speakLine(id === 'chain' ? 'Fallback voice chain is on. This is how I sound.' : 'This is how I sound.');
 }
 
 // VoiceStudio checked now; when it isn't ready, the reason is said (and shown where it was asked from).
@@ -1866,9 +1990,15 @@ async function voiceKeyLogin({ provider = tts().id, thenVoice = false, given = n
     return say(p.text, 'concerned', p);
   }
   ttsKeys[t.id] = 'own';
-  config.tts = t.id;
+  // Keep the fallback chain selected when a key is added from the Voice chain UI.
+  if (was !== 'chain') config.tts = t.id;
+  if (t.id === 'microsoft' && key.includes('|')) {
+    const reg = key.slice(0, key.indexOf('|')).trim();
+    if (reg) config.microsoftRegion = reg;
+  }
   if (thenVoice || config.replies !== 'voice') config.replies = 'voice';
   saveConfig(); agentStale = true;
+  if (was === 'chain') await useTts('chain').catch(() => {});
   menu(); if (onboarding) obState();
   voiceProblemAt = 0; // a new key's first failure is said straight away
   if (!tried.ok) return say(`${t.name} key saved, but it won't speak yet: ${voiceWhy(tried.message)}. Replies are text until it does.`, 'concerned');
@@ -1896,12 +2026,21 @@ function setLogin(on) { login.asked = true; send({ type: 'login_item', on }); }
 // page: this copy can't replace itself (Linux, installed from a .deb or .rpm), so "install" opens the download page.
 const update = { available: null, told: null, manual: false, installing: false, checking: false, result: null, page: false, done: null };
 function checkUpdates(manual = false) {
+  // EXTENSION: protect fork extras — notify only; never auto-replace the app from upstream releases.
+  if (config.protectExtensions && !manual) {
+    logLine('update_status', { state: 'skipped', reason: 'protectExtensions' });
+    return;
+  }
   update.manual = manual;
   if (manual) { update.checking = true; update.result = null; panel(); }
   send({ type: 'update', install: false });
 }
 function installUpdate() {
   if (update.installing) return;
+  if (config.protectExtensions) {
+    say('Automatic installs are off so your custom Roamies extras stay intact. Merge upstream in git and rebuild, or turn off Protect extensions in Voice settings.', 'concerned');
+    return;
+  }
   update.installing = true; menu();
   send({ type: 'update', install: true });
 }
@@ -2218,12 +2357,21 @@ function panelState() {
     commitments: openCommitments().map((c) => ({ id: c.id, text: c.text, due: c.due ?? null, when: c.due ? `${fmtWhen(c.due)}${c.repeat ? ` · repeats ${repeatLabel(c.repeat)}` : ''}` : '', overdue: !!(c.due && c.due < Date.now()), repeat: c.repeat ?? null })),
     look: config.look ?? 'classic', looks: LOOKS.map(([id, label]) => [id, label]), name: lookName(),
     size: sizeNow(), sizes: SIZES,
-    replies: VOICE_ON() ? 'voice' : 'text', tts: tts().id, fishKey: hasVoiceKey('fish'), geminiKey: hasVoiceKey('gemini'), cartesiaKey: hasVoiceKey('cartesia'),
-    fishModel: config.fishModel, fishModels: FISH_CHOICES, fishFree: tts().id === 'fish' && speech.on && speech.model.endsWith('-free'),
+    replies: VOICE_ON() ? 'voice' : 'text', tts: tts().id,
+    fishKey: hasVoiceKey('fish'), geminiKey: hasVoiceKey('gemini'), cartesiaKey: hasVoiceKey('cartesia'),
+    elevenlabsKey: hasVoiceKey('elevenlabs'), microsoftKey: hasVoiceKey('microsoft'), openrouterKey: hasVoiceKey('openrouter'), sayKey: hasVoiceKey('say'),
+    fishModel: config.fishModel, fishModels: FISH_CHOICES, fishFree: speech.provider === 'fish' && speech.on && String(speech.model).endsWith('-free'),
     geminiVoice: geminiVoice(), geminiVoices: GEMINI_VOICES, geminiShared: ttsKeys.gemini === 'shared',
     geminiModel: config.geminiModel, geminiModels: GEMINI_CHOICES,
     cartesiaModel: config.cartesiaModel, cartesiaModels: CARTESIA_CHOICES, cartesiaVoice: config.cartesiaVoice,
-    studio: tts().local ? studioState() : null,
+    // EXTENSION: chain + new providers for the Voice page
+    voiceChain: voiceChainNow(), voiceChainLabels: CHAIN_LABELS, protectExtensions: config.protectExtensions !== false, selfConfigure: config.selfConfigure !== false,
+    elevenlabsModel: config.elevenlabsModel, elevenlabsModels: ELEVEN_CHOICES, elevenlabsVoice: config.elevenlabsVoice,
+    microsoftVoice: config.microsoftVoice, microsoftRegion: config.microsoftRegion, microsoftModels: MS_CHOICES,
+    openrouterSpeechModel: config.openrouterSpeechModel, openrouterSpeechModels: OR_SPEECH_CHOICES, openrouterSpeechVoice: config.openrouterSpeechVoice,
+    openrouterShared: ttsKeys.openrouter === 'shared',
+    activeVoice: speech.provider,
+    studio: config.tts === 'voicestudio' ? studioState() : null,
     voice: VOICE_OK ? {
       on: !!config.voice, lang: speechLangId(), langOnline: langInfo && langInfo.id === speechLangId() ? langInfo.online : null, studioSpeak: config.studioSpeak === 'full' || config.studioSpeak === 'medium' ? config.studioSpeak : 'short', keys: HOTKEYS_OK ? talkSymbols() : null, ready: voiceReady(), mac: MAC, mute: config.muteWhileTalking !== false, autoListen: !!config.autoListen, listenEvery: !!config.listenEvery, listenSecs: listenSecs(), listenChoices: LISTEN_SECS, snoozeListen: !!config.snoozeListen, wakeWord: !!config.wakeWord, wakeName: wakeName(config), wakePhrase: wakePhrase(config), wakeRelisten: !!config.wakeRelisten,
       // The mic picker: what the voice helper lists, the pick ('' is automatic) and the mic automatic uses now.
@@ -2472,11 +2620,46 @@ async function onMenu(id, via) {
   else if (id.startsWith('fishmodel:') && FISH_CHOICES.some((c) => c.id === id.slice(10))) {
     config.fishModel = id.slice(10); saveConfig(); speech.setModel(config.fishModel); menu();
   }
-  else if (id === 'fishkey') voiceKeyLogin({ provider: 'fish' });
-  else if (id === 'fishkey_remove') removeVoiceKey('fish');
-  else if (id === 'geminikey') voiceKeyLogin({ provider: 'gemini' });
-  else if (id === 'geminikey_remove') removeVoiceKey('gemini');
+  else if (id === 'fishkey' || id === 'geminikey' || id === 'cartesiakey' || id === 'elevenlabskey' || id === 'microsoftkey' || id === 'openrouterkey') {
+    voiceKeyLogin({ provider: id.replace(/key$/, '') });
+  }
+  else if (id === 'fishkey_remove' || id === 'geminikey_remove' || id === 'cartesiakey_remove' || id === 'elevenlabskey_remove' || id === 'microsoftkey_remove' || id === 'openrouterkey_remove') {
+    removeVoiceKey(id.replace(/key_remove$/, ''));
+  }
   else if (id.startsWith('tts:')) setTts(id.slice(4));
+  else if (id.startsWith('voicechain:')) {
+    // voicechain:up:cartesia / voicechain:down:elevenlabs / voicechain:toggle:openrouter
+    const [, op, which] = id.split(':');
+    let chain = voiceChainNow();
+    if (op === 'toggle' && which) {
+      chain = chain.includes(which) ? chain.filter((x) => x !== which) : normalizeVoiceChain([...chain, which]);
+    } else if ((op === 'up' || op === 'down') && which) {
+      const i = chain.indexOf(which);
+      if (i < 0) return;
+      const j = op === 'up' ? i - 1 : i + 1;
+      if (j < 0 || j >= chain.length) return;
+      [chain[i], chain[j]] = [chain[j], chain[i]];
+    } else return;
+    config.voiceChain = normalizeVoiceChain(chain); saveConfig();
+    if (config.tts === 'chain') await useTts('chain').catch(() => {});
+    menu();
+  }
+  else if (id === 'protectextensions') { config.protectExtensions = !config.protectExtensions; saveConfig(); menu(); }
+  else if (id === 'selfconfigure') { config.selfConfigure = !config.selfConfigure; saveConfig(); agentStale = true; menu(); }
+  else if (id.startsWith('elevenlabsmodel:') && ELEVEN_CHOICES.some((c) => c.id === id.slice(16))) {
+    config.elevenlabsModel = id.slice(16); saveConfig(); if (speech.provider === 'elevenlabs') speech.setModel(config.elevenlabsModel); menu();
+  }
+  else if (id.startsWith('openrouterspeech:') && OR_SPEECH_CHOICES.some((c) => c.id === id.slice(17))) {
+    config.openrouterSpeechModel = id.slice(17); saveConfig(); if (speech.provider === 'openrouter') speech.setModel(config.openrouterSpeechModel); menu();
+  }
+  else if (id === 'openrouterspeech_refresh') {
+    const [k] = await voiceKey('openrouter').catch(() => [null]);
+    try {
+      const models = await listOpenrouterSpeechModels({ key: k });
+      if (models.length) say(`Found ${models.length} OpenRouter speech models. Pick one on the Voice page (starters listed; full ids work via configure_self).`, 'happy');
+      else say('No OpenRouter speech models came back.', 'concerned');
+    } catch (e) { say(`Couldn't list OpenRouter speech models: ${String(e.message || e).slice(0, 120)}`, 'concerned'); }
+  }
   else if (id.startsWith('geminivoice:')) setGeminiVoice(id.slice(12));
   else if (id.startsWith('studiovoice:')) setStudioVoice(id.slice(12));
   else if (id === 'voicestudio_check') { await speech.checkLocal(); menu(); if (onboarding) obState(); }
@@ -2561,11 +2744,8 @@ async function onMenu(id, via) {
   }
   else if (id === 'screenmemory') {
     config.screenMemory = !config.screenMemory; saveConfig();
-    if (config.screenMemory && !config.paused) {
-      const helper = process.env.ROAMIES_SCREENMEM || path.join(path.dirname(fileURLToPath(import.meta.url)), 'screenmem-helper.mjs');
-      spawnScreenmemHelper(helper, { dataDir: path.join(DATA_DIR, 'screenmem') });
-      addonTools._screenmemControl?.start?.().catch(() => {});
-    } else addonTools._screenmemControl?.stop?.().catch(() => {});
+    if (config.screenMemory && !config.paused) ensureScreenmem().catch(() => {});
+    else addonTools._screenmemControl?.stop?.().catch(() => {});
     menu();
   }
   else if (id === 'osnotify') { config.osNotify = !config.osNotify; saveConfig(); menu(); }
@@ -2740,7 +2920,7 @@ function obState() {
     look: config.look ?? 'classic',
     size: sizeNow(),
     replies: VOICE_ON() ? 'voice' : 'text', // voice only when it can really speak: a service picked without its key yet shows as text
-    tts: tts().id, fishKey: hasVoiceKey('fish'), geminiKey: hasVoiceKey('gemini'),
+    tts: tts().id, fishKey: hasVoiceKey('fish'), geminiKey: hasVoiceKey('gemini'), cartesiaKey: hasVoiceKey('cartesia'),
     geminiVoice: geminiVoice(), geminiVoices: GEMINI_VOICES, geminiShared: ttsKeys.gemini === 'shared',
     studio: tts().local ? studioState() : null,
   });
@@ -2773,16 +2953,17 @@ async function onGuide(m) {
   else if (m.type === 'chat_skip') { endIntro(); config.introDone = true; saveConfig(); menu(); }
   else if (m.type === 'chat_forget' && typeof m.id === 'string') { await forgetFact(m.id); ob({ kind: 'chat_facts', facts: introFacts() }); menu(); }
   else if (m.type === 'ob_step') { config.onboardStep = Math.max(0, Math.min(8, m.step | 0)); saveConfig(); }
-  // Voice needs a working key first: without one, the guide asks for it (ob_fishkey or ob_geminikey) instead.
+  // Voice needs a working key first: without one, the guide asks for it (ob_fishkey / ob_geminikey / ob_cartesiakey) instead.
   else if (m.type === 'ob_replies' && (m.mode === 'text' || (m.mode === 'voice' && speech.on))) { await voiceKeysLoaded; await setReplies(m.mode); }
   // A service picked in the guide that already has its key: it speaks from now on (voice goes on if it was text).
   else if (m.type === 'ob_tts') { await setTts(m.provider); if (speech.on && tts().id === m.provider) await setReplies('voice'); }
   else if (m.type === 'ob_geminivoice') setGeminiVoice(m.voice);
   else if (m.type === 'ob_studiovoice' && typeof m.voice === 'string') setStudioVoice(m.voice);
   else if (m.type === 'ob_studiocheck') { await speech.checkLocal(); obState(); }
-  else if ((m.type === 'ob_fishkey' || m.type === 'ob_geminikey') && typeof m.key === 'string') {
+  else if ((m.type === 'ob_fishkey' || m.type === 'ob_geminikey' || m.type === 'ob_cartesiakey') && typeof m.key === 'string') {
     const note = (text, bad, p) => ob({ kind: 'fish', ok: !bad, error: bad ? text : null, ...(bad && p ? linked(p) : {}) });
-    await voiceKeyLogin({ provider: m.type === 'ob_geminikey' ? 'gemini' : 'fish', given: m.key.slice(0, 1000), thenVoice: true, note }).catch((e) => { const p = problem('key', e, { store: KEY_STORE }); note(p.text, true, p); });
+    const provider = m.type === 'ob_geminikey' ? 'gemini' : m.type === 'ob_cartesiakey' ? 'cartesia' : 'fish';
+    await voiceKeyLogin({ provider, given: m.key.slice(0, 1000), thenVoice: true, note }).catch((e) => { const p = problem('key', e, { store: KEY_STORE }); note(p.text, true, p); });
   }
   else if (m.type === 'ob_login' && OAUTH[m.provider]) oauthLogin(m.provider, typeof m.id === 'string' ? m.id.slice(0, 40) : undefined);
   else if (m.type === 'ob_login_cancel') cancelLogin(typeof m.id === 'string' ? m.id : undefined);
@@ -2825,7 +3006,15 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       .catch((e) => { const p = problem('key', e, { store: KEY_STORE }); panelNote(p.text, true, p); });
   } else if (m.type === 'panel_local_add' && typeof m.label === 'string' && typeof m.baseUrl === 'string') {
     addServer({ label: m.label.slice(0, 200), baseUrl: m.baseUrl.slice(0, 500), key: typeof m.key === 'string' ? m.key.trim().slice(0, 1000) : '', images: m.images === true }).catch((e) => console.error('add server', e));
-  } else if ((m.type === 'panel_fishkey' || m.type === 'panel_geminikey') && typeof m.key === 'string') voiceKeyLogin({ provider: m.type === 'panel_geminikey' ? 'gemini' : 'fish', given: m.key.slice(0, 1000), note: panelNote }).catch((e) => console.error('voice key', e));
+  } else if (/^panel_(fish|gemini|cartesia|elevenlabs|microsoft|openrouter)key$/.test(m.type) && typeof m.key === 'string') {
+    let key = m.key.slice(0, 1000);
+    const provider = m.type.slice(6, -3);
+    // Microsoft: panel may send REGION|KEY; if only a key, prepend configured region.
+    if (provider === 'microsoft' && key && !key.includes('|') && config.microsoftRegion) {
+      key = `${config.microsoftRegion}|${key}`;
+    }
+    voiceKeyLogin({ provider, given: key, note: panelNote }).catch((e) => console.error('voice key', e));
+  }
   else if (m.type === 'answer') { pending.get(m.id)?.(m.text ?? null); pending.delete(m.id); }
   else if (m.type === 'ui_ready') {
     retired.then((notes) => { if (notes.length) { retired = Promise.resolve([]); say(`${notes.join(' ')} Do it on the Model page in ${PANEL}.`, 'concerned'); } });
